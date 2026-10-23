@@ -5,6 +5,7 @@ import ProjectsView from './components/ProjectsView.vue'
 import WorkspaceView from './components/WorkspaceView.vue'
 import SettingsDialog from './components/SettingsDialog.vue'
 import ProjectDialog from './components/ProjectDialog.vue'
+import DeployDialog from './components/DeployDialog.vue'
 import {
   store,
   loadState,
@@ -15,6 +16,7 @@ import {
   initRouter,
   backToProjects,
   currentProject,
+  openDeployDialog,
 } from './lib/store.js'
 import { ltr } from './lib/format.js'
 
@@ -90,6 +92,10 @@ function disableDemo() {
           <span class="dot" />
           {{ connectionState.label }}
         </span>
+        <button v-if="project" class="btn btn-ghost btn-sm" @click="openDeployDialog(project)">
+          <AppIcon name="upload" :size="14" />
+          部署
+        </button>
         <button class="btn btn-ghost btn-sm" @click="store.settingsOpen = true">
           <AppIcon name="gear" :size="14" />
           设置
@@ -124,6 +130,7 @@ function disableDemo() {
 
     <SettingsDialog />
     <ProjectDialog />
+    <DeployDialog />
 
     <div class="toasts">
       <transition-group name="toast">

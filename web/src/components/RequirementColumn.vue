@@ -10,21 +10,63 @@ import {
   executeRequirement,
   abortRequirement,
   removeRequirement,
+  removeAttachment,
   selectRequirement,
   projectRequirements,
+  pushToast,
 } from '../lib/store.js'
 
 const text = ref('')
 const submitting = ref(false)
+const files = ref([])
+const fileInput = ref(null)
 const requirements = computed(() => projectRequirements())
+const MAX_FILE_SIZE = 30 * 1024 * 1024
 
 async function submit() {
   const value = text.value.trim()
   if (!value || submitting.value) return
   submitting.value = true
-  await addRequirement(value)
-  text.value = ''
+  const pending = files.value.slice()
+  const requirement = await addRequirement(value, pending)
   submitting.value = false
+  if (requirement) {
+    text.value = ''
+    files.value = []
+  }
+}
+
+function pickFiles() {
+  fileInput.value?.click()
+}
+
+function onFilesChange(event) {
+  const selected = Array.from(event.target.files || [])
+  for (const file of selected) {
+    if (file.size > MAX_FILE_SIZE) {
+      pushToast(`「${file.name}」超过 30MB，已跳过`, 'error')
+      continue
+    }
+    const duplicate = files.value.some((item) => item.name === file.name && item.size === file.size)
+    if (!duplicate) files.value.push(file)
+  }
+  event.target.value = ''
+}
+
+function removeFile(index) {
+  files.value.splice(index, 1)
+}
+
+function formatSize(bytes) {
+  if (!bytes && bytes !== 0) return ''
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+async function removeExistingAttachment(requirement, attachment) {
+  if (!window.confirm(`删除附件「${attachment.name}」？`)) return
+  await removeAttachment(requirement.id, attachment.id)
 }
 
 function split(requirement) {
@@ -78,9 +120,27 @@ function canExecute(requirement) {
         @keydown.ctrl.enter.prevent="submit"
         @keydown.meta.enter.prevent="submit"
       />
+      <div class="composer-tools">
+        <button class="attach-btn" type="button" @click="pickFiles">
+          <AppIcon name="paperclip" :size="13" />
+          添加附件
+        </button>
+        <input ref="fileInput" class="file-input" type="file" multiple @change="onFilesChange" />
+        <span class="composer-tip">可上传截图、日志、设计稿、文档等</span>
+      </div>
+      <div v-if="files.length" class="file-chips">
+        <span v-for="(file, index) in files" :key="`${file.name}-${file.size}`" class="file-chip">
+          <AppIcon name="file" :size="12" />
+          <span class="file-chip-name">{{ file.name }}</span>
+          <span class="file-chip-size">{{ formatSize(file.size) }}</span>
+          <button class="chip-x" type="button" title="移除" @click="removeFile(index)">
+            <AppIcon name="x" :size="11" />
+          </button>
+        </span>
+      </div>
       <button class="btn btn-primary btn-block" :disabled="!text.trim() || submitting" @click="submit">
         <AppIcon name="plus" :size="15" />
-        添加需求
+        {{ submitting ? '添加中…' : '添加需求' }}
       </button>
       <p class="composer-hint">Ctrl / ⌘ + Enter 快速提交</p>
     </div>
@@ -106,6 +166,28 @@ function canExecute(requirement) {
         </div>
 
         <p v-if="requirement.text !== requirement.title" class="requirement-text">{{ requirement.text }}</p>
+
+        <div v-if="requirement.attachments?.length" class="attachments">
+          <a
+            v-for="attachment in requirement.attachments"
+            :key="attachment.id"
+            class="attach-chip"
+            :href="`/api/requirements/${requirement.id}/attachments/${attachment.id}`"
+            :title="`下载 ${attachment.name}`"
+            @click.stop
+          >
+            <AppIcon name="file" :size="11" />
+            <span class="attach-name">{{ attachment.name }}</span>
+            <button
+              class="chip-x"
+              type="button"
+              title="删除附件"
+              @click.prevent.stop="removeExistingAttachment(requirement, attachment)"
+            >
+              <AppIcon name="x" :size="10" />
+            </button>
+          </a>
+        </div>
 
         <div class="requirement-meta">
           <StatusPill :status="requirement.status" />
@@ -195,6 +277,109 @@ function canExecute(requirement) {
   color: #a8b1bf;
   text-align: right;
   margin-bottom: 4px;
+}
+
+.composer-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.attach-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-soft);
+  border: 1px dashed var(--border-strong);
+  background: #fff;
+  border-radius: 8px;
+  padding: 4px 9px;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.attach-btn:hover {
+  border-color: var(--green);
+  color: var(--green-dark);
+  background: #f6fffb;
+}
+
+.file-input {
+  display: none;
+}
+
+.composer-tip {
+  font-size: 11px;
+  color: #a8b1bf;
+}
+
+.file-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.file-chip,
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  font-size: 11px;
+  color: var(--text-soft);
+  background: #f1f5f9;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 2px 6px;
+}
+
+.file-chip-name,
+.attach-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 130px;
+}
+
+.file-chip-size {
+  color: #9aa4b2;
+  font-size: 10.5px;
+}
+
+.chip-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border-radius: 4px;
+  color: #94a3b8;
+  flex: none;
+}
+
+.chip-x:hover {
+  background: rgba(220, 38, 38, 0.12);
+  color: var(--red);
+}
+
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.attach-chip {
+  text-decoration: none;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.attach-chip:hover {
+  border-color: #c8dfd3;
+  background: #f3fbf7;
+  color: var(--green-dark);
 }
 
 .requirement {

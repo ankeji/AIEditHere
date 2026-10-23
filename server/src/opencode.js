@@ -19,13 +19,11 @@ async function request(pathname, { method = 'GET', body, timeout = 30000, direct
     Accept: 'application/json',
     ...(body ? { 'Content-Type': 'application/json' } : {}),
   }
-  // opencode 支持用 x-opencode-directory 指定项目目录，
-  // 这样同一个 opencode 服务可以服务多个项目，代码只会写在对应项目里。
+  // opencode 1.19 起通过查询参数 directory 指定项目目录（同一个服务可以服务多个项目），
+  // 老版本用的是 x-opencode-directory 头，这里同时带上，兼容两种实现。
   if (directory) {
+    target.searchParams.set('directory', directory)
     headers['x-opencode-directory'] = encodeURIComponent(directory)
-    if (method === 'GET' || method === 'HEAD') {
-      target.searchParams.set('directory', directory)
-    }
   }
   try {
     const res = await fetch(target.toString(), {
@@ -71,6 +69,90 @@ export async function health() {
   }
 }
 
+/* --------------------------- 模型目录 / 校验 --------------------------- */
+
+let catalogCache = { at: 0, data: null }
+const CATALOG_TTL = 5 * 60 * 1000
+
+/**
+ * 拉取 opencode 当前可用的模型列表。
+ * 返回 { models: [{ providerID, providerName, modelID, name }], default: 'provider/model' }
+ */
+export async function modelCatalog({ force = false } = {}) {
+  if (!force && catalogCache.data && Date.now() - catalogCache.at < CATALOG_TTL) {
+    return catalogCache.data
+  }
+  const [providers, cfg] = await Promise.all([
+    request('/config/providers', { timeout: 8000 }),
+    request('/config', { timeout: 8000 }).catch(() => null),
+  ])
+  const list = Array.isArray(providers?.providers)
+    ? providers.providers
+    : Object.values(providers?.providers || {})
+  const models = []
+  for (const provider of list) {
+    if (!provider || typeof provider !== 'object') continue
+    const providerID = provider.id || provider.providerID || ''
+    if (!providerID) continue
+    const providerName = provider.name || providerID
+    const source = provider.models && typeof provider.models === 'object' ? provider.models : {}
+    for (const [modelID, meta] of Object.entries(source)) {
+      models.push({
+        providerID,
+        providerName,
+        modelID,
+        name: meta?.name || modelID,
+      })
+    }
+  }
+  const data = { models, default: String(cfg?.model || '').trim() }
+  catalogCache = { at: Date.now(), data }
+  return data
+}
+
+function modelLabel(model) {
+  return `${model.providerID}/${model.modelID}`
+}
+
+/**
+ * 解析出这次请求要用的模型，并校验它确实存在于 opencode 里。
+ * 不存在时直接抛出可读的错误（而不是让 opencode 返回 500）。
+ */
+export async function resolveModel() {
+  const wanted = String(config.model || '').trim()
+  if (wanted && !parseModel(wanted)) {
+    throw new OpencodeError(`设置中的模型「${wanted}」格式不正确，应为 provider/model，例如 opencode/big-pickle`)
+  }
+  let catalog = null
+  try {
+    catalog = await modelCatalog()
+  } catch {
+    // 老版本 opencode 没有 /config/providers，跳过校验
+    return wanted ? parseModel(wanted) : null
+  }
+  const raw = wanted || catalog.default
+  if (!raw) return wanted ? parseModel(wanted) : null
+  const parsed = parseModel(raw)
+  if (!parsed) return null
+  const exists = catalog.models.some(
+    (m) => m.providerID === parsed.providerID && m.modelID === parsed.modelID,
+  )
+  if (!exists) {
+    const sameProvider = catalog.models
+      .filter((m) => m.providerID === parsed.providerID)
+      .map(modelLabel)
+    const suggestions = (sameProvider.length ? sameProvider : catalog.models.map(modelLabel)).slice(0, 8)
+    const hint = suggestions.length
+      ? `可用模型：${suggestions.join('、')}${sameProvider.length > 8 ? ' …' : ''}`
+      : 'opencode 中没有可用模型，请先执行 `opencode auth login` 配置模型'
+    const source = wanted ? 'AutoCode 设置中的模型' : 'opencode 默认模型'
+    throw new OpencodeError(
+      `${source}「${raw}」不存在。${hint}。请在设置中选择可用模型，或修改 opencode 配置。`,
+    )
+  }
+  return parsed
+}
+
 export async function createSession(title, directory) {
   const data = await request('/session', { method: 'POST', body: { title }, directory })
   const id = data?.id || data?.session?.id
@@ -103,7 +185,7 @@ export async function prompt(sessionId, { text, format, system, timeout = 30 * 6
   const body = {
     parts: [{ type: 'text', text }],
   }
-  const model = parseModel()
+  const model = await resolveModel()
   if (model) body.model = model
   if (config.agent) body.agent = config.agent
   if (format) body.format = format

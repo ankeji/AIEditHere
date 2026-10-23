@@ -18,6 +18,8 @@ export const store = reactive({
   toasts: [],
   settingsOpen: false,
   projectDialog: { open: false, project: null },
+  deployDialog: { open: false, projectId: null },
+  deployLogs: {},
   eventSource: null,
 })
 
@@ -33,7 +35,14 @@ export async function api(method, path, body) {
   } catch {
     /* 忽略空响应 */
   }
-  if (!res.ok) throw new Error(data?.error || `请求失败 (${res.status})`)
+  if (!res.ok) {
+    const message =
+      data?.error ||
+      (res.status >= 500
+        ? `服务暂时不可用（${res.status}），后端可能正在重启，请稍后重试`
+        : `请求失败 (${res.status})`)
+    throw new Error(message)
+  }
   return data
 }
 
@@ -153,6 +162,21 @@ export function connectEvents() {
       /* 忽略无效数据 */
     }
   })
+  source.addEventListener('deploy-log', (event) => {
+    try {
+      const data = JSON.parse(event.data)
+      appendDeployLog(data.projectId, data.envId, data.level, data.text)
+    } catch {
+      /* 忽略无效数据 */
+    }
+  })
+  source.addEventListener('deploy-status', (event) => {
+    try {
+      updateEnvStatus(JSON.parse(event.data))
+    } catch {
+      /* 忽略无效数据 */
+    }
+  })
 }
 
 /* ----------------------------- 选择器 ----------------------------- */
@@ -177,15 +201,66 @@ export function selectRequirement(id) {
 
 /* ----------------------------- 需求操作 ----------------------------- */
 
-export async function addRequirement(text) {
+export async function inspectPath(targetPath) {
+  return api('GET', `/api/fs/inspect?path=${encodeURIComponent(targetPath || '')}`)
+}
+
+export async function listDir(targetPath) {
+  return api('GET', `/api/fs/list?path=${encodeURIComponent(targetPath || '')}`)
+}
+
+async function uploadAttachment(requirementId, file) {
+  const res = await fetch(
+    `/api/requirements/${requirementId}/attachments?name=${encodeURIComponent(file.name)}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: file,
+    },
+  )
+  let data = null
+  try {
+    data = await res.json()
+  } catch {
+    /* 忽略空响应 */
+  }
+  if (!res.ok) throw new Error(data?.error || `附件上传失败 (${res.status})`)
+  return data?.attachment
+}
+
+export async function addRequirement(text, files = []) {
   try {
     const requirement = await api('POST', '/api/requirements', {
       text,
       projectId: store.route.projectId || undefined,
     })
     store.selectedId = requirement.id
+    if (files.length) {
+      let uploaded = 0
+      for (const file of files) {
+        try {
+          await uploadAttachment(requirement.id, file)
+          uploaded += 1
+        } catch (err) {
+          pushToast(`附件「${file.name}」上传失败：${err.message}`, 'error')
+        }
+      }
+      if (uploaded) pushToast(`已上传 ${uploaded} 个附件`, 'success')
+    }
+    return requirement
   } catch (err) {
     pushToast(err.message, 'error')
+    return null
+  }
+}
+
+export async function removeAttachment(requirementId, attachmentId) {
+  try {
+    await api('DELETE', `/api/requirements/${requirementId}/attachments/${attachmentId}`)
+    return true
+  } catch (err) {
+    pushToast(err.message, 'error')
+    return false
   }
 }
 
@@ -312,4 +387,109 @@ export async function refreshHealth() {
 export function initRouter() {
   applyRoute()
   window.addEventListener('hashchange', applyRoute)
+}
+
+/* ----------------------------- 部署 ----------------------------- */
+
+export function openDeployDialog(project) {
+  if (!project) return
+  store.deployDialog = { open: true, projectId: project.id }
+}
+
+export function closeDeployDialog() {
+  store.deployDialog = { open: false, projectId: null }
+}
+
+function deployKey(projectId, envId) {
+  return `${projectId}:${envId}`
+}
+
+function ensureDeployLog(projectId, envId) {
+  const key = deployKey(projectId, envId)
+  if (!store.deployLogs[key]) store.deployLogs[key] = { entries: [], version: 0, runId: null }
+  return store.deployLogs[key]
+}
+
+function appendDeployLog(projectId, envId, level, text) {
+  if (!text) return
+  const buf = ensureDeployLog(projectId, envId)
+  const last = buf.entries[buf.entries.length - 1]
+  if (
+    level === 'out' &&
+    last &&
+    last.level === 'out' &&
+    !last.text.endsWith('\n') &&
+    last.text.length + text.length < 8000
+  ) {
+    last.text += text
+  } else {
+    buf.entries.push({ level, text })
+  }
+  while (buf.entries.length > 2000) buf.entries.shift()
+  buf.version++
+}
+
+function updateEnvStatus({ projectId, envId, status, error, at }) {
+  const project = store.projects.find((item) => item.id === projectId)
+  const env = project?.deploy?.environments?.find((item) => item.id === envId)
+  if (!env) return
+  env.lastStatus = status
+  if (status === 'success') {
+    env.lastDeployedAt = at || Date.now()
+    env.lastError = null
+  } else if (status === 'failed') {
+    env.lastError = error || '部署失败'
+  } else if (status === 'cancelled' || status === 'running') {
+    env.lastError = null
+  }
+}
+
+export async function saveDeploy(projectId, deploy, { silent = false } = {}) {
+  try {
+    const data = await api('PUT', `/api/projects/${projectId}/deploy`, deploy)
+    if (data?.project) {
+      const index = store.projects.findIndex((item) => item.id === projectId)
+      if (index >= 0) store.projects[index] = data.project
+    }
+    if (!silent) pushToast('部署配置已保存', 'success')
+    return true
+  } catch (err) {
+    pushToast(err.message, 'error')
+    return false
+  }
+}
+
+export async function runDeploy(projectId, envId) {
+  const buf = ensureDeployLog(projectId, envId)
+  buf.entries = []
+  buf.version++
+  buf.runId = null
+  try {
+    const data = await api('POST', `/api/projects/${projectId}/deploy/${envId}`)
+    buf.runId = data?.runId || null
+    return data
+  } catch (err) {
+    pushToast(err.message, 'error')
+    return null
+  }
+}
+
+export async function abortDeploy(projectId, envId) {
+  try {
+    await api('POST', `/api/projects/${projectId}/deploy/${envId}/abort`)
+    pushToast('已请求中止部署', 'info')
+  } catch (err) {
+    pushToast(err.message, 'error')
+  }
+}
+
+export async function loadDeployLogs(projectId, envId) {
+  try {
+    const data = await api('GET', `/api/projects/${projectId}/deploy/${envId}/logs`)
+    const buf = ensureDeployLog(projectId, envId)
+    buf.entries = Array.isArray(data?.logs) ? data.logs : []
+    buf.version++
+  } catch {
+    /* 忽略 */
+  }
 }

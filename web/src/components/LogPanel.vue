@@ -5,6 +5,8 @@ const props = defineProps({
   logs: { type: Array, default: () => [] },
   version: { type: Number, default: 0 },
   live: { type: Boolean, default: false },
+  maxHeight: { type: Number, default: 170 },
+  minHeight: { type: Number, default: 0 },
 })
 
 const box = ref(null)
@@ -29,7 +31,14 @@ watch(
 </script>
 
 <template>
-  <div ref="box" class="log-box">
+  <div
+    ref="box"
+    class="log-box"
+    :style="{
+      maxHeight: `${props.maxHeight}px`,
+      minHeight: props.minHeight ? `${props.minHeight}px` : 'auto',
+    }"
+  >
     <template v-if="props.logs.length">
       <div
         v-for="(entry, index) in props.logs"
@@ -47,7 +56,6 @@ watch(
   background: #10161f;
   border-radius: 9px;
   padding: 9px 11px;
-  max-height: 170px;
   overflow-y: auto;
   font-family: 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
   font-size: 11.5px;

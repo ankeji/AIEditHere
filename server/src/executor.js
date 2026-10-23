@@ -101,6 +101,20 @@ const SPLIT_SCHEMA = {
   required: ['tasks'],
 }
 
+function attachmentBlock(req) {
+  const files = Array.isArray(req?.attachments) ? req.attachments : []
+  if (!files.length) return ''
+  const lines = files.map((file, index) => {
+    const size = typeof file.size === 'number' ? `，${file.size} 字节` : ''
+    return `${index + 1}. ${file.name}${size} → ${file.path}`
+  })
+  return [
+    '',
+    '相关附件（请用读取文件的工具按下面的绝对路径查看并参考）：',
+    ...lines,
+  ].join('\n')
+}
+
 function buildSplitPrompt(req, project) {
   return [
     '你是一名资深技术负责人，需要把需求拆解成可以逐个执行的开发任务。',
@@ -110,6 +124,7 @@ function buildSplitPrompt(req, project) {
     '"""',
     req.text,
     '"""',
+    attachmentBlock(req),
     '',
     '拆解要求：',
     '1. 拆成 3~8 个任务，每个任务都能独立执行、独立验证；',
@@ -343,6 +358,7 @@ function buildTaskPrompt(req, task, total, project) {
     '"""',
     req.text,
     '"""',
+    attachmentBlock(req),
     '',
     `现在只需要完成子任务 ${task.index}/${total}：${task.title}`,
     task.description ? `任务说明：${task.description}` : '',

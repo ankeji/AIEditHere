@@ -110,6 +110,39 @@ const props = defineProps({
       <path d="M3 12h.01" />
       <path d="M3 18h.01" />
     </template>
+    <template v-else-if="props.name === 'upload'">
+      <path d="M12 15V4" />
+      <path d="m7 8 5-4 5 4" />
+      <path d="M20 15v3a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-3" />
+    </template>
+    <template v-else-if="props.name === 'server'">
+      <rect x="3" y="4" width="18" height="7" rx="2" />
+      <rect x="3" y="13" width="18" height="7" rx="2" />
+      <path d="M7 7.5h.01" />
+      <path d="M7 16.5h.01" />
+    </template>
+    <template v-else-if="props.name === 'key'">
+      <circle cx="8" cy="15" r="4" />
+      <path d="m10.8 12.2 8.2-8.2" />
+      <path d="M17 6h3v3" />
+    </template>
+    <template v-else-if="props.name === 'paperclip'">
+      <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+    </template>
+    <template v-else-if="props.name === 'file'">
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+      <path d="M14 3v5h5" />
+    </template>
+    <template v-else-if="props.name === 'alert'">
+      <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+      <path d="M12 9v4" />
+      <path d="M12 17h.01" />
+    </template>
+    <template v-else-if="props.name === 'download'">
+      <path d="M12 4v12" />
+      <path d="m7 11 5 5 5-5" />
+      <path d="M20 20H4" />
+    </template>
     <template v-else>
       <circle cx="12" cy="12" r="9" />
     </template>

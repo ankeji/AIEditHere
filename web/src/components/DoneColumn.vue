@@ -62,6 +62,7 @@ function retry(task) {
     </div>
 
     <div v-else class="panel-body done-body">
+      <TransitionGroup :key="requirement.id" name="done" tag="div" class="done-list">
       <article v-for="task in doneTasks" :key="task.id" class="done-card">
         <div class="done-head">
           <span class="done-check"><AppIcon name="check" :size="12" :stroke="2.8" /></span>
@@ -82,6 +83,7 @@ function retry(task) {
           {{ summaryOpen(task) ? '收起' : '展开全部' }}
         </button>
       </article>
+      </TransitionGroup>
 
       <template v-if="failedTasks.length">
         <div class="failed-divider">
@@ -111,6 +113,44 @@ function retry(task) {
 
 .done-body {
   padding-top: 12px;
+}
+
+.done-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  position: relative;
+}
+
+/* 任务执行完成、从第 2 列挪到第 3 列：由左滑入并淡入 */
+.done-card.done-enter-active {
+  transition:
+    opacity 0.4s ease,
+    transform 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.done-enter-from {
+  opacity: 0;
+  transform: translateX(-22px) scale(0.96);
+}
+
+.done-enter-to {
+  opacity: 1;
+  transform: translateX(0) scale(1);
+}
+
+.done-card.done-move {
+  transition: transform 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.done-card.done-leave-active {
+  transition: opacity 0.2s ease;
+  position: absolute;
+  width: 100%;
+}
+
+.done-leave-to {
+  opacity: 0;
 }
 
 .done-card {

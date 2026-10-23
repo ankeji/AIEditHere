@@ -1,10 +1,21 @@
 <script setup>
 import { reactive, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
-import { store, saveProject, closeProjectDialog } from '../lib/store.js'
+import FolderPicker from './FolderPicker.vue'
+import { store, saveProject, closeProjectDialog, inspectPath } from '../lib/store.js'
 
 const form = reactive({ name: '', path: '', description: '', create: true })
 const saving = ref(false)
+const pickerOpen = ref(false)
+const pathInfo = reactive({
+  checking: false,
+  checked: false,
+  exists: false,
+  isDir: false,
+  packageName: '',
+  isGit: false,
+})
+let inspectTimer = null
 
 watch(
   () => store.projectDialog.open,
@@ -15,8 +26,49 @@ watch(
     form.path = project?.path || ''
     form.description = project?.description || ''
     form.create = true
+    Object.assign(pathInfo, { checking: false, checked: false, exists: false, isDir: false, packageName: '', isGit: false })
+    if (form.path) checkPath(form.path)
   },
 )
+
+watch(
+  () => form.path,
+  (value) => {
+    if (inspectTimer) clearTimeout(inspectTimer)
+    pathInfo.checked = false
+    if (!value || !value.trim()) return
+    inspectTimer = setTimeout(() => checkPath(value), 450)
+  },
+)
+
+async function checkPath(value) {
+  if (!value || !value.trim()) return null
+  pathInfo.checking = true
+  try {
+    const info = await inspectPath(value.trim())
+    pathInfo.checked = true
+    pathInfo.exists = Boolean(info.exists)
+    pathInfo.isDir = Boolean(info.isDir)
+    pathInfo.packageName = info.packageName || ''
+    pathInfo.isGit = Boolean(info.isGit)
+    return info
+  } catch {
+    pathInfo.checked = false
+    return null
+  } finally {
+    pathInfo.checking = false
+  }
+}
+
+async function onPickFolder(path) {
+  pickerOpen.value = false
+  form.path = path
+  const info = await checkPath(path)
+  if (!form.name.trim()) {
+    const suggested = info?.packageName || info?.name || ''
+    if (suggested) form.name = suggested
+  }
+}
 
 async function submit() {
   if (saving.value) return
@@ -54,9 +106,36 @@ async function submit() {
 
         <label class="field">
           <span class="field-label"><AppIcon name="link" :size="13" /> 本地文件夹位置</span>
-          <input v-model="form.path" type="text" placeholder="/Users/you/projects/blog" />
+          <div class="path-row">
+            <input v-model="form.path" type="text" placeholder="/Users/you/projects/blog 或 D:\\projects\\blog" />
+            <button class="btn btn-ghost btn-sm browse-btn" type="button" @click="pickerOpen = true">
+              <AppIcon name="folder" :size="14" />
+              浏览
+            </button>
+          </div>
+          <div class="path-status">
+            <span v-if="pathInfo.checking" class="ps ps-check">检测目录中…</span>
+            <template v-else-if="pathInfo.checked">
+              <span v-if="pathInfo.exists && pathInfo.isDir" class="ps ps-ok">
+                <AppIcon name="check" :size="12" />
+                目录已存在，可直接导入此项目
+                <span v-if="pathInfo.isGit" class="tag">Git 仓库</span>
+                <span v-if="pathInfo.packageName" class="tag">{{ pathInfo.packageName }}</span>
+              </span>
+              <span v-else-if="pathInfo.exists && !pathInfo.isDir" class="ps ps-err">
+                <AppIcon name="alert" :size="12" />
+                该路径是文件，不是文件夹
+              </span>
+              <span v-else class="ps ps-warn">
+                <AppIcon name="alert" :size="12" />
+                目录不存在
+                <template v-if="form.create">，创建项目时会自动新建</template>
+                <template v-else>，请先把项目下载到本地或选择其它目录</template>
+              </span>
+            </template>
+          </div>
           <span class="field-hint">
-            填绝对路径最稳妥（支持 ~ 开头）。opencode 会在这个目录里读写代码，需求产出的所有文件都会保留在这里。
+            可点击「浏览」选择本地已有项目目录（导入），也可以直接填写新目录路径；支持 ~ 开头。
           </span>
         </label>
 
@@ -83,6 +162,13 @@ async function submit() {
         </button>
       </footer>
     </div>
+
+    <FolderPicker
+      v-if="pickerOpen"
+      :initial="form.path"
+      @select="onPickFolder"
+      @close="pickerOpen = false"
+    />
   </div>
 </template>
 
@@ -190,6 +276,67 @@ async function submit() {
   font-size: 11.5px;
   color: #9aa4b2;
   line-height: 1.5;
+}
+
+.path-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.path-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.browse-btn {
+  flex: none;
+  white-space: nowrap;
+}
+
+.path-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 0;
+}
+
+.ps {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  border-radius: 7px;
+  padding: 3px 8px;
+  line-height: 1.4;
+}
+
+.ps-check {
+  color: var(--muted);
+  background: #f1f3f6;
+}
+
+.ps-ok {
+  color: var(--green-dark);
+  background: var(--green-soft);
+}
+
+.ps-warn {
+  color: #8a5b12;
+  background: #fff7ea;
+}
+
+.ps-err {
+  color: var(--red);
+  background: var(--red-soft);
+}
+
+.tag {
+  font-size: 10.5px;
+  font-weight: 600;
+  border-radius: 5px;
+  padding: 0 5px;
+  background: rgba(0, 0, 0, 0.06);
 }
 
 .switch-row {

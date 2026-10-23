@@ -28,6 +28,12 @@ function load() {
     db.requirements = []
     db.projects = []
   }
+
+  let migrated = false
+  for (const project of db.projects) {
+    if (ensureProjectDeploy(project)) migrated = true
+  }
+  if (migrated) persist(true)
 }
 
 let saveTimer = null
@@ -92,6 +98,7 @@ export function createRequirement(text, projectId) {
     createdAt: Date.now(),
     updatedAt: Date.now(),
     tasks: [],
+    attachments: [],
   }
   db.requirements.unshift(requirement)
   touch()
@@ -105,6 +112,58 @@ export function findProject(id) {
   return db.projects.find((p) => p.id === id) || null
 }
 
+/** 默认部署配置：构建命令 + 输出目录 + 测试/生产两套环境 */
+export function defaultDeploy() {
+  return {
+    /** 部署前的构建命令，留空表示跳过构建（如纯静态页面 / 已构建好的产物） */
+    buildCommand: 'npm run build',
+    /** 构建产物路径，相对项目目录；目录或单个文件（如 jar）都可以 */
+    outputPath: 'dist',
+    /** 上传时忽略的文件规则（.gitignore 风格，每行一条） */
+    ignorePatterns: '',
+    environments: [
+      createDefaultEnv('测试环境'),
+      createDefaultEnv('生产环境'),
+    ],
+  }
+}
+
+function createDefaultEnv(name) {
+  return {
+    id: crypto.randomUUID(),
+    name,
+    host: '',
+    port: 22,
+    username: 'root',
+    password: '',
+    remoteDir: '',
+    /** 可选：单独覆盖项目级的构建命令 / 输出目录 */
+    buildCommand: '',
+    outputPath: '',
+    lastStatus: 'idle',
+    lastDeployedAt: null,
+    lastError: null,
+  }
+}
+
+/** 老数据迁移：没有 deploy 字段的项目补一份默认部署配置 */
+function ensureProjectDeploy(project) {
+  if (!project.deploy || typeof project.deploy !== 'object') {
+    project.deploy = defaultDeploy()
+    return true
+  }
+  let changed = false
+  if (!Array.isArray(project.deploy.environments)) {
+    project.deploy.environments = []
+    changed = true
+  }
+  if (typeof project.deploy.ignorePatterns !== 'string') {
+    project.deploy.ignorePatterns = ''
+    changed = true
+  }
+  return changed
+}
+
 export function createProject({ name, path: projectPath, description = '' }) {
   const project = {
     id: crypto.randomUUID(),
@@ -113,8 +172,19 @@ export function createProject({ name, path: projectPath, description = '' }) {
     description: String(description || '').trim(),
     createdAt: Date.now(),
     updatedAt: Date.now(),
+    deploy: defaultDeploy(),
   }
   db.projects.unshift(project)
+  touch()
+  broadcastState()
+  return project
+}
+
+export function setProjectDeploy(id, deploy) {
+  const project = findProject(id)
+  if (!project) return null
+  project.deploy = deploy
+  project.updatedAt = Date.now()
   touch()
   broadcastState()
   return project
@@ -200,6 +270,15 @@ export function recoverInterrupted() {
       if (task.status === 'running') {
         task.status = 'failed'
         task.error = '服务重启，任务已中断'
+        changed = true
+      }
+    }
+  }
+  for (const project of db.projects) {
+    for (const env of project.deploy?.environments || []) {
+      if (env.lastStatus === 'running') {
+        env.lastStatus = 'failed'
+        env.lastError = '服务重启，部署已中断'
         changed = true
       }
     }

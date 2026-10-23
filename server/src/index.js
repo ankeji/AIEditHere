@@ -1,6 +1,8 @@
 import express from 'express'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { config, saveConfig, publicConfig } from './config.js'
 import {
@@ -11,12 +13,15 @@ import {
   createProject,
   updateProject,
   removeProject,
+  findProject,
+  setProjectDeploy,
   findRequirement,
   removeRequirement,
   recoverInterrupted,
   persist,
+  touch,
 } from './store.js'
-import { ensureProjectPath } from './projectPath.js'
+import { ensureProjectPath, normalizeProjectPath } from './projectPath.js'
 import { bus } from './bus.js'
 import * as oc from './opencode.js'
 import {
@@ -26,7 +31,14 @@ import {
   handleOpencodeEvent,
   HttpError,
 } from './executor.js'
-import { WEB_DIST } from './paths.js'
+import {
+  normalizeDeploy,
+  runDeploy,
+  abortEnvDeploy,
+  isEnvDeploying,
+  getDeployLogs,
+} from './deploy.js'
+import { WEB_DIST, DATA_DIR } from './paths.js'
 
 const app = express()
 app.use(express.json({ limit: '2mb' }))
@@ -198,6 +210,16 @@ app.get('/api/opencode/agents', asyncRoute(async (req, res) => {
   }
 }))
 
+app.get('/api/opencode/models', asyncRoute(async (req, res) => {
+  if (config.demo) return res.json({ models: [], default: '', error: null })
+  try {
+    const catalog = await oc.modelCatalog({ force: req.query.force === '1' })
+    res.json({ models: catalog.models, default: catalog.default, error: null })
+  } catch (err) {
+    res.json({ models: [], default: '', error: err?.message || '无法获取 opencode 模型列表' })
+  }
+}))
+
 app.post('/api/requirements', (req, res) => {
   const text = String(req.body?.text || '').trim()
   if (!text) return res.status(400).json({ error: '需求内容不能为空' })
@@ -271,9 +293,53 @@ app.delete('/api/projects/:id', (req, res) => {
   res.json({ ok: true })
 })
 
+/* -------------------------- 项目部署配置 & 部署 -------------------------- */
+
+app.put('/api/projects/:id/deploy', (req, res, next) => {
+  const project = findProject(req.params.id)
+  if (!project) return next(new HttpError(404, '项目不存在'))
+  const deploy = normalizeDeploy(req.body || {}, project)
+  const updated = setProjectDeploy(project.id, deploy)
+  res.json({ project: updated })
+})
+
+app.post('/api/projects/:id/deploy/:envId', (req, res, next) => {
+  const project = findProject(req.params.id)
+  if (!project) return next(new HttpError(404, '项目不存在'))
+  const env = (project.deploy?.environments || []).find((item) => item.id === req.params.envId)
+  if (!env) return next(new HttpError(404, '部署环境不存在'))
+  if (isEnvDeploying(project.id, env.id) || env.lastStatus === 'running') {
+    return next(new HttpError(409, '该环境正在部署中'))
+  }
+  if (!env.host || !env.username || !env.remoteDir) {
+    return next(new HttpError(400, '请先填写服务器地址、用户名和远程目录'))
+  }
+  const runId = crypto.randomUUID()
+  res.status(202).json({ runId })
+  runDeploy(project, env, runId).catch((err) => console.error('[deploy]', err?.message))
+})
+
+app.post('/api/projects/:id/deploy/:envId/abort', (req, res, next) => {
+  const project = findProject(req.params.id)
+  if (!project) return next(new HttpError(404, '项目不存在'))
+  const env = (project.deploy?.environments || []).find((item) => item.id === req.params.envId)
+  if (!env) return next(new HttpError(404, '部署环境不存在'))
+  const ok = abortEnvDeploy(project, env)
+  res.json({ ok })
+})
+
+app.get('/api/projects/:id/deploy/:envId/logs', (req, res, next) => {
+  const project = findProject(req.params.id)
+  if (!project) return next(new HttpError(404, '项目不存在'))
+  const env = (project.deploy?.environments || []).find((item) => item.id === req.params.envId)
+  if (!env) return next(new HttpError(404, '部署环境不存在'))
+  res.json({ logs: getDeployLogs(project.id, env.id) })
+})
+
 app.delete('/api/requirements/:id', (req, res) => {
   const req0 = findRequirement(req.params.id)
   if (!req0) return res.status(404).json({ error: '需求不存在' })
+  removeRequirementFiles(req0)
   removeRequirement(req.params.id)
   res.json({ ok: true })
 })
@@ -323,6 +389,195 @@ app.post('/api/requirements/:id/tasks/:taskId/retry', (req, res, next) => {
   executeRequirement(requirement.id, [task.id]).catch((err) => console.error('[retry]', err?.message))
 })
 
+/* --------------------------- 本地文件系统浏览 --------------------------- */
+
+function listWindowsDrives() {
+  const drives = []
+  for (let i = 67; i <= 90; i += 1) {
+    const letter = String.fromCharCode(i)
+    const root = `${letter}:\\`
+    try {
+      if (fs.existsSync(root)) drives.push({ name: root, path: root })
+    } catch {
+      /* 忽略不可访问的盘符 */
+    }
+  }
+  return drives
+}
+
+app.get('/api/fs/inspect', (req, res) => {
+  const raw = String(req.query.path || '').trim()
+  if (!raw) return res.json({ path: '', exists: false, isDir: false })
+  let resolved
+  try {
+    resolved = normalizeProjectPath(raw)
+  } catch (err) {
+    return res.status(400).json({ error: `路径无效：${err?.message || err}` })
+  }
+  let exists = false
+  let isDir = false
+  try {
+    const stat = fs.statSync(resolved)
+    exists = true
+    isDir = stat.isDirectory()
+  } catch {
+    exists = false
+  }
+  let packageName = ''
+  let isGit = false
+  if (exists && isDir) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(resolved, 'package.json'), 'utf8'))
+      if (pkg && typeof pkg.name === 'string') packageName = pkg.name
+    } catch {
+      /* 没有 package.json */
+    }
+    try {
+      isGit = fs.existsSync(path.join(resolved, '.git'))
+    } catch {
+      /* 忽略 */
+    }
+  }
+  res.json({
+    path: resolved,
+    name: path.basename(resolved) || resolved,
+    exists,
+    isDir,
+    packageName,
+    isGit,
+  })
+})
+
+app.get('/api/fs/list', (req, res) => {
+  const target = String(req.query.path || '').trim()
+  let resolved
+  try {
+    resolved = target ? normalizeProjectPath(target) : os.homedir()
+  } catch {
+    resolved = os.homedir()
+  }
+  let isDir = false
+  try {
+    isDir = fs.statSync(resolved).isDirectory()
+  } catch {
+    isDir = false
+  }
+  let dirs = []
+  if (isDir) {
+    try {
+      dirs = fs
+        .readdirSync(resolved, { withFileTypes: true })
+        .filter((entry) => {
+          if (entry.isDirectory()) return true
+          if (entry.isSymbolicLink()) {
+            try {
+              return fs.statSync(path.join(resolved, entry.name)).isDirectory()
+            } catch {
+              return false
+            }
+          }
+          return false
+        })
+        .map((entry) => ({ name: entry.name, path: path.join(resolved, entry.name) }))
+        .filter((entry) => !entry.name.startsWith('.'))
+        .sort((a, b) => a.name.localeCompare(b.name))
+    } catch (err) {
+      return res.status(400).json({ error: `无法读取目录：${err?.message || err}` })
+    }
+  }
+  const parent = path.dirname(resolved)
+  const atRoot = parent === resolved
+  const payload = {
+    path: resolved,
+    exists: isDir,
+    parent: atRoot ? null : parent,
+    dirs,
+    home: os.homedir(),
+    isWindows: process.platform === 'win32',
+  }
+  if (atRoot && process.platform === 'win32') payload.drives = listWindowsDrives()
+  res.json(payload)
+})
+
+/* ----------------------------- 需求附件 ----------------------------- */
+
+const ATTACH_ROOT = path.join(DATA_DIR, 'attachments')
+
+function attachmentDir(requirementId) {
+  return path.join(ATTACH_ROOT, String(requirementId))
+}
+
+function sanitizeFileName(name) {
+  const base = path
+    .basename(String(name || 'file'))
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+    .trim()
+  return base || 'file'
+}
+
+function removeRequirementFiles(requirement) {
+  try {
+    fs.rmSync(attachmentDir(requirement.id), { recursive: true, force: true })
+  } catch {
+    /* 忽略清理失败 */
+  }
+}
+
+app.post(
+  '/api/requirements/:id/attachments',
+  express.raw({ type: () => true, limit: '30mb' }),
+  (req, res, next) => {
+    const requirement = findRequirement(req.params.id)
+    if (!requirement) return next(new HttpError(404, '需求不存在'))
+    const buffer = Buffer.isBuffer(req.body) ? req.body : null
+    if (!buffer || !buffer.length) return next(new HttpError(400, '文件内容为空'))
+    const name = sanitizeFileName(req.query.name)
+    const id = crypto.randomUUID()
+    const dir = attachmentDir(requirement.id)
+    fs.mkdirSync(dir, { recursive: true })
+    const filePath = path.join(dir, `${id}-${name}`)
+    try {
+      fs.writeFileSync(filePath, buffer)
+    } catch (err) {
+      return next(new HttpError(500, `保存附件失败：${err?.message || err}`))
+    }
+    const attachment = { id, name, size: buffer.length, path: filePath, createdAt: Date.now() }
+    if (!Array.isArray(requirement.attachments)) requirement.attachments = []
+    requirement.attachments.push(attachment)
+    requirement.updatedAt = Date.now()
+    touch()
+    broadcastState()
+    res.status(201).json({ attachment })
+  },
+)
+
+app.get('/api/requirements/:id/attachments/:attId', (req, res, next) => {
+  const requirement = findRequirement(req.params.id)
+  if (!requirement) return next(new HttpError(404, '需求不存在'))
+  const attachment = (requirement.attachments || []).find((item) => item.id === req.params.attId)
+  if (!attachment || !fs.existsSync(attachment.path)) {
+    return next(new HttpError(404, '附件不存在'))
+  }
+  res.download(attachment.path, attachment.name)
+})
+
+app.delete('/api/requirements/:id/attachments/:attId', (req, res, next) => {
+  const requirement = findRequirement(req.params.id)
+  if (!requirement) return next(new HttpError(404, '需求不存在'))
+  const index = (requirement.attachments || []).findIndex((item) => item.id === req.params.attId)
+  if (index < 0) return next(new HttpError(404, '附件不存在'))
+  const [attachment] = requirement.attachments.splice(index, 1)
+  try {
+    fs.rmSync(attachment.path, { force: true })
+  } catch {
+    /* 忽略删除失败 */
+  }
+  requirement.updatedAt = Date.now()
+  touch()
+  broadcastState()
+  res.json({ ok: true })
+})
+
 /* ------------------------------- SSE ------------------------------- */
 
 app.get('/api/events', (req, res) => {
@@ -334,17 +589,44 @@ app.get('/api/events', (req, res) => {
   })
   res.write('retry: 3000\n\n')
 
-  const send = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`)
+  let closed = false
+  let heartbeat = null
+  let unsubscribe = null
+
+  // 连接可能被代理 / 浏览器悄悄掐断，必须主动清理，否则后续写入会抛出未捕获的 stream error 把进程带崩
+  const stop = () => {
+    if (closed) return
+    closed = true
+    if (heartbeat) clearInterval(heartbeat)
+    if (unsubscribe) unsubscribe()
+    heartbeat = null
+    unsubscribe = null
+  }
+
+  const send = (type, data) => {
+    if (closed || res.destroyed || res.writableEnded) return stop()
+    try {
+      res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`)
+    } catch {
+      stop()
+    }
+  }
+
+  res.on('close', stop)
+  res.on('error', stop)
+  req.on('error', stop)
 
   send('state', publicState())
 
-  const unsubscribe = bus.subscribe(({ type, data }) => send(type, data))
-  const heartbeat = setInterval(() => res.write(': ping\n\n'), 20000)
-
-  req.on('close', () => {
-    clearInterval(heartbeat)
-    unsubscribe()
-  })
+  unsubscribe = bus.subscribe(({ type, data }) => send(type, data))
+  heartbeat = setInterval(() => {
+    if (closed || res.destroyed || res.writableEnded) return stop()
+    try {
+      res.write(': ping\n\n')
+    } catch {
+      stop()
+    }
+  }, 20000)
 })
 
 /* ------------------------------ 静态资源 ------------------------------ */

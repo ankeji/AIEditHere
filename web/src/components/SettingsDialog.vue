@@ -1,17 +1,50 @@
 <script setup>
-import { reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
-import { store, saveConfig } from '../lib/store.js'
+import { store, saveConfig, api } from '../lib/store.js'
 
 const form = reactive({ ...store.config })
 const saving = ref(false)
+const models = ref([])
+const ocDefault = ref('')
+const modelsError = ref('')
+
+const modelOptions = computed(() =>
+  models.value.map((item) => ({
+    value: `${item.providerID}/${item.modelID}`,
+    label: `${item.providerName || item.providerID} · ${item.name || item.modelID}`,
+  })),
+)
+
+const defaultInvalid = computed(() => {
+  if (!ocDefault.value || !models.value.length) return false
+  return !models.value.some((item) => `${item.providerID}/${item.modelID}` === ocDefault.value)
+})
 
 watch(
   () => store.settingsOpen,
   (open) => {
-    if (open) Object.assign(form, store.config)
+    if (open) {
+      Object.assign(form, store.config)
+      loadModels()
+    }
   },
 )
+
+async function loadModels() {
+  models.value = []
+  ocDefault.value = ''
+  modelsError.value = ''
+  if (form.demo) return
+  try {
+    const data = await api('GET', '/api/opencode/models')
+    if (data?.error) modelsError.value = data.error
+    models.value = Array.isArray(data?.models) ? data.models : []
+    ocDefault.value = data?.default || ''
+  } catch (err) {
+    modelsError.value = err.message
+  }
+}
 
 async function save() {
   if (saving.value) return
@@ -57,7 +90,27 @@ function close() {
         <div class="field-row">
           <label class="field">
             <span class="field-label">模型</span>
-            <input v-model="form.model" type="text" placeholder="provider/model，留空用默认" />
+            <input
+              v-model="form.model"
+              type="text"
+              list="oc-model-options"
+              placeholder="provider/model，留空用默认"
+            />
+            <datalist id="oc-model-options">
+              <option v-for="item in modelOptions" :key="item.value" :value="item.value">
+                {{ item.label }}
+              </option>
+            </datalist>
+            <span v-if="modelsError" class="field-hint warn">{{ modelsError }}</span>
+            <span v-else-if="defaultInvalid" class="field-hint warn">
+              opencode 默认模型「{{ ocDefault }}」不存在，请从下拉列表选一个可用模型
+            </span>
+            <span v-else-if="ocDefault" class="field-hint">
+              留空使用 opencode 默认模型：{{ ocDefault }}
+            </span>
+            <span v-else-if="models.length" class="field-hint">
+              可从下拉列表选择模型，留空使用 opencode 默认模型
+            </span>
           </label>
           <label class="field">
             <span class="field-label">Agent</span>
@@ -215,6 +268,10 @@ function close() {
   font-size: 11.5px;
   color: #9aa4b2;
   line-height: 1.5;
+}
+
+.field-hint.warn {
+  color: #c96a1b;
 }
 
 .field-row {

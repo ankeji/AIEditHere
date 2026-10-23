@@ -154,62 +154,72 @@ function taskStateClass(task) {
           还没有拆解结果，点击上方「拆解需求」让 AI 生成任务列表
         </div>
 
-        <article
-          v-for="task in orderedTasks"
-          :key="task.id"
-          class="task"
-          :class="taskStateClass(task)"
+        <TransitionGroup
+          v-else
+          :key="requirement.id"
+          name="task"
+          tag="div"
+          class="task-list"
+          appear
         >
-          <div class="task-head">
-            <span class="task-index" :class="`idx-${task.status}`">
-              <span v-if="task.status === 'done'"><AppIcon name="check" :size="12" :stroke="2.6" /></span>
-              <span v-else-if="task.status === 'running'" class="spinner" />
-              <span v-else-if="task.status === 'failed'"><AppIcon name="x" :size="12" :stroke="2.6" /></span>
-              <template v-else>{{ task.index }}</template>
-            </span>
-            <div class="task-main">
-              <h3 class="task-title">{{ task.title }}</h3>
-              <p v-if="task.description && task.description !== task.title" class="task-desc">
-                {{ task.description }}
-              </p>
+          <article
+            v-for="(task, taskIndex) in orderedTasks"
+            :key="task.id"
+            class="task"
+            :class="taskStateClass(task)"
+            :style="{ '--enter-i': taskIndex }"
+          >
+            <div class="task-head">
+              <span class="task-index" :class="`idx-${task.status}`">
+                <span v-if="task.status === 'done'"><AppIcon name="check" :size="12" :stroke="2.6" /></span>
+                <span v-else-if="task.status === 'running'" class="spinner" />
+                <span v-else-if="task.status === 'failed'"><AppIcon name="x" :size="12" :stroke="2.6" /></span>
+                <template v-else>{{ task.index }}</template>
+              </span>
+              <div class="task-main">
+                <h3 class="task-title">{{ task.title }}</h3>
+                <p v-if="task.description && task.description !== task.title" class="task-desc">
+                  {{ task.description }}
+                </p>
+              </div>
+              <div class="task-aside">
+                <StatusPill :status="task.status" />
+              </div>
             </div>
-            <div class="task-aside">
-              <StatusPill :status="task.status" />
+
+            <div class="task-foot">
+              <span v-if="task.startedAt" class="task-time">
+                <AppIcon name="clock" :size="12" />
+                {{ duration(task.startedAt, task.finishedAt) }}
+              </span>
+              <button
+                v-if="task.logs?.length"
+                class="link-btn"
+                @click="toggleLogs(task)"
+              >
+                <AppIcon name="terminal" :size="12" />
+                {{ logsOpen(task) ? '收起日志' : `查看日志 (${task.logs.length})` }}
+              </button>
+              <button
+                v-if="task.status === 'failed'"
+                class="btn btn-ghost btn-xs retry"
+                @click="retry(task)"
+              >
+                <AppIcon name="refresh" :size="12" />
+                重试
+              </button>
             </div>
-          </div>
 
-          <div class="task-foot">
-            <span v-if="task.startedAt" class="task-time">
-              <AppIcon name="clock" :size="12" />
-              {{ duration(task.startedAt, task.finishedAt) }}
-            </span>
-            <button
-              v-if="task.logs?.length"
-              class="link-btn"
-              @click="toggleLogs(task)"
-            >
-              <AppIcon name="terminal" :size="12" />
-              {{ logsOpen(task) ? '收起日志' : `查看日志 (${task.logs.length})` }}
-            </button>
-            <button
-              v-if="task.status === 'failed'"
-              class="btn btn-ghost btn-xs retry"
-              @click="retry(task)"
-            >
-              <AppIcon name="refresh" :size="12" />
-              重试
-            </button>
-          </div>
+            <div v-if="task.error && !logsOpen(task)" class="error-box">{{ task.error }}</div>
 
-          <div v-if="task.error && !logsOpen(task)" class="error-box">{{ task.error }}</div>
-
-          <LogPanel
-            v-if="logsOpen(task)"
-            :logs="task.logs || []"
-            :version="task.logVersion || 0"
-            :live="task.status === 'running'"
-          />
-        </article>
+            <LogPanel
+              v-if="logsOpen(task)"
+              :logs="task.logs || []"
+              :version="task.logVersion || 0"
+              :live="task.status === 'running'"
+            />
+          </article>
+        </TransitionGroup>
       </div>
     </template>
   </section>
@@ -286,6 +296,50 @@ function taskStateClass(task) {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  position: relative;
+}
+
+/* 任务重新排序（执行完沉底）时的位移动画 */
+.task.task-move {
+  transition: transform 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* 拆解后任务进入第 2 列：从左侧滑入并淡入，按顺序轻微错开 */
+.task.task-enter-active {
+  transition:
+    opacity 0.34s ease,
+    transform 0.34s cubic-bezier(0.22, 1, 0.36, 1);
+  transition-delay: calc(var(--enter-i, 0) * 45ms);
+}
+
+.task-enter-from {
+  opacity: 0;
+  transform: translateX(-16px) scale(0.98);
+}
+
+.task-enter-to {
+  opacity: 1;
+  transform: translateX(0) scale(1);
+}
+
+/* 任务离开（如重新拆解清空）时淡出 */
+.task.task-leave-active {
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease;
+  position: absolute;
+  width: 100%;
+}
+
+.task-leave-to {
+  opacity: 0;
+  transform: scale(0.96);
 }
 
 .task {
