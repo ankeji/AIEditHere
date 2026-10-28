@@ -145,7 +145,7 @@ export async function resolveModel() {
     const hint = suggestions.length
       ? `可用模型：${suggestions.join('、')}${sameProvider.length > 8 ? ' …' : ''}`
       : 'opencode 中没有可用模型，请先执行 `opencode auth login` 配置模型'
-    const source = wanted ? 'AutoCode 设置中的模型' : 'opencode 默认模型'
+    const source = wanted ? 'AIEditHere 设置中的模型' : 'opencode 默认模型'
     throw new OpencodeError(
       `${source}「${raw}」不存在。${hint}。请在设置中选择可用模型，或修改 opencode 配置。`,
     )

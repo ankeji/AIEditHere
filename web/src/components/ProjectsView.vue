@@ -7,6 +7,7 @@ import {
   openProject,
   openProjectDialog,
   openDeployDialog,
+  openAccessDialog,
   removeProject,
   inspectPath,
   pushToast,
@@ -15,17 +16,6 @@ import {
 const projects = computed(() => store.projects)
 const missing = ref(null)
 const checking = ref(null)
-
-function statsOf(project) {
-  const items = store.requirements.filter((item) => item.projectId === project.id)
-  const done = items.filter((item) => item.status === 'done').length
-  const total = items.length
-  return {
-    total,
-    done,
-    percent: total ? Math.round((done / total) * 100) : 0,
-  }
-}
 
 async function open(project) {
   if (checking.value) return
@@ -60,12 +50,28 @@ function edit(project) {
   openProjectDialog(project)
 }
 
+function typeLabel(project) {
+  return project.type === 'frontend' ? '前端' : '后端'
+}
+
+function pathLabel(project) {
+  return ltr(project.path)
+}
+
+function createdLabel(project) {
+  return fromNow(project.createdAt)
+}
+
 function deploy(project) {
   openDeployDialog(project)
 }
 
+function share(project) {
+  openAccessDialog(project)
+}
+
 function remove(project) {
-  if (!window.confirm(`删除项目「${project.name}」？该项目下的需求也会一并删除。`)) return
+  if (!window.confirm(`删除项目「${project.name}」？`)) return
   removeProject(project.id)
 }
 </script>
@@ -75,7 +81,7 @@ function remove(project) {
     <div class="page-head">
       <div>
         <h1>项目</h1>
-        <p>每个项目对应一个本地文件夹，需求产生的代码都会写进这个文件夹里</p>
+        <p>每个项目对应一个本地文件夹，代码、预览和部署都在这里管理</p>
       </div>
       <button class="btn btn-primary" @click="openProjectDialog(null)">
         <AppIcon name="plus" :size="15" />
@@ -106,19 +112,30 @@ function remove(project) {
         <div class="card-head">
           <span class="card-icon"><AppIcon name="folder" :size="16" /></span>
           <div class="card-title">
-            <h2>{{ project.name }}</h2>
-            <p class="card-path" :title="project.path">{{ ltr(project.path) }}</p>
+            <div class="title-row">
+              <h2>{{ project.name }}</h2>
+              <span v-if="!project.isOwner" class="share-badge">共享给我</span>
+              <span class="type-badge" :class="project.type || 'backend'">
+                {{ typeLabel(project) }}
+              </span>
+            </div>
+            <p class="card-path" :title="project.path">{{ pathLabel(project) }}</p>
           </div>
           <div class="card-actions" @click.stop>
-            <button class="icon-btn" title="部署上线" @click="deploy(project)">
-              <AppIcon name="upload" :size="14" />
-            </button>
-            <button class="icon-btn" title="编辑项目" @click="edit(project)">
-              <AppIcon name="gear" :size="14" />
-            </button>
-            <button class="icon-btn danger" title="删除项目" @click="remove(project)">
-              <AppIcon name="trash" :size="14" />
-            </button>
+            <template v-if="project.isOwner">
+              <button class="icon-btn" title="可见范围" @click="share(project)">
+                <AppIcon name="share" :size="14" />
+              </button>
+              <button class="icon-btn" title="部署上线" @click="deploy(project)">
+                <AppIcon name="upload" :size="14" />
+              </button>
+              <button class="icon-btn" title="编辑项目" @click="edit(project)">
+                <AppIcon name="gear" :size="14" />
+              </button>
+              <button class="icon-btn danger" title="删除项目" @click="remove(project)">
+                <AppIcon name="trash" :size="14" />
+              </button>
+            </template>
           </div>
         </div>
 
@@ -126,25 +143,21 @@ function remove(project) {
 
         <div class="card-stats">
           <span class="stat">
-            <AppIcon name="list" :size="12" />
-            {{ statsOf(project).total }} 个需求
+            <AppIcon name="folder" :size="12" />
+            {{ typeLabel(project) }}项目
           </span>
-          <span class="stat">
-            <AppIcon name="check" :size="12" />
-            {{ statsOf(project).done }} 个已完成
+          <span v-if="project.previewUrl" class="stat cmd" :title="project.previewUrl">
+            <AppIcon name="globe" :size="12" />
+            {{ project.previewUrl }}
           </span>
-          <span class="stat time">创建于 {{ fromNow(project.createdAt) }}</span>
-        </div>
-
-        <div class="progress">
-          <div class="progress-bar" :style="{ width: `${statsOf(project).percent}%` }" />
+          <span class="stat time">创建于 {{ createdLabel(project) }}</span>
         </div>
 
         <div class="card-foot">
-          <span class="percent">{{ statsOf(project).percent }}%</span>
+          <span class="foot-note">{{ project.isOwner ? '我的项目' : '共享给我' }}</span>
           <button class="btn btn-soft btn-xs">
-            <AppIcon name="play" :size="12" />
-            进入项目
+            <AppIcon :name="project.type === 'frontend' ? 'globe' : 'folder'" :size="12" />
+            打开项目
           </button>
         </div>
       </article>
@@ -256,6 +269,54 @@ function remove(project) {
   word-break: break-word;
 }
 
+.title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
+
+.title-row h2 {
+  min-width: 0;
+}
+
+.type-badge {
+  flex: none;
+  font-size: 10.5px;
+  font-weight: 700;
+  border-radius: 5px;
+  padding: 1px 6px;
+  letter-spacing: 0.2px;
+}
+
+.share-badge {
+  flex: none;
+  font-size: 10.5px;
+  font-weight: 700;
+  border-radius: 5px;
+  padding: 1px 6px;
+  color: #8a5b12;
+  background: #fff7ea;
+}
+
+.type-badge.frontend {
+  color: var(--green-dark);
+  background: var(--green-soft);
+}
+
+.type-badge.backend {
+  color: #3a5a86;
+  background: var(--blue-soft);
+}
+
+.stat.cmd {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 .card-path {
   margin-top: 2px;
   font-size: 11.5px;
@@ -303,31 +364,15 @@ function remove(project) {
   margin-left: auto;
 }
 
-.progress {
-  height: 5px;
-  border-radius: 99px;
-  background: #eef1f5;
-  overflow: hidden;
-}
-
-.progress-bar {
-  height: 100%;
-  border-radius: 99px;
-  background: linear-gradient(90deg, #4cc693, var(--green));
-  transition: width 0.35s ease;
-}
-
 .card-foot {
   display: flex;
   align-items: center;
   justify-content: space-between;
 }
 
-.percent {
-  font-size: 12px;
-  color: var(--green-dark);
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
+.foot-note {
+  font-size: 11.5px;
+  color: var(--muted);
 }
 
 .hint {

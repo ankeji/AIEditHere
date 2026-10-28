@@ -115,6 +115,22 @@ const props = defineProps({
       <path d="m7 8 5-4 5 4" />
       <path d="M20 15v3a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-3" />
     </template>
+    <template v-else-if="props.name === 'globe'">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 12h18" />
+      <path d="M12 3a14.5 14.5 0 0 1 0 18" />
+      <path d="M12 3a14.5 14.5 0 0 0 0 18" />
+    </template>
+    <template v-else-if="props.name === 'external'">
+      <path d="M15 3h6v6" />
+      <path d="M10 14 21 3" />
+      <path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5" />
+    </template>
+    <template v-else-if="props.name === 'layers'">
+      <path d="m12 2 9 5-9 5-9-5 9-5z" />
+      <path d="m3 12 9 5 9-5" />
+      <path d="m3 17 9 5 9-5" />
+    </template>
     <template v-else-if="props.name === 'server'">
       <rect x="3" y="4" width="18" height="7" rx="2" />
       <rect x="3" y="13" width="18" height="7" rx="2" />
@@ -125,6 +141,41 @@ const props = defineProps({
       <circle cx="8" cy="15" r="4" />
       <path d="m10.8 12.2 8.2-8.2" />
       <path d="M17 6h3v3" />
+    </template>
+    <template v-else-if="props.name === 'mail'">
+      <rect x="3" y="5" width="18" height="14" rx="2" />
+      <path d="m3.5 7 8.5 6 8.5-6" />
+    </template>
+    <template v-else-if="props.name === 'users'">
+      <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+      <circle cx="9" cy="7" r="4" />
+      <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+      <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+    </template>
+    <template v-else-if="props.name === 'share'">
+      <circle cx="18" cy="5" r="3" />
+      <circle cx="6" cy="12" r="3" />
+      <circle cx="18" cy="19" r="3" />
+      <path d="m8.59 13.51 6.83 3.98" />
+      <path d="m15.41 6.51-6.82 3.98" />
+    </template>
+    <template v-else-if="props.name === 'lock'">
+      <rect x="4" y="10" width="16" height="11" rx="2" />
+      <path d="M8 10V7a4 4 0 0 1 8 0v3" />
+    </template>
+    <template v-else-if="props.name === 'eye'">
+      <path d="M2 12s3.5-6.5 10-6.5S22 12 22 12s-3.5 6.5-10 6.5S2 12 2 12z" />
+      <circle cx="12" cy="12" r="2.7" />
+    </template>
+    <template v-else-if="props.name === 'eye-off'">
+      <path d="M3 3l18 18" />
+      <path d="M10.6 5.7A10.7 10.7 0 0 1 12 5.5c6.5 0 10 6.5 10 6.5a17 17 0 0 1-3.2 4.1" />
+      <path d="M6.5 7.9A16.6 16.6 0 0 0 2 12s3.5 6.5 10 6.5c1.6 0 3-.4 4.2-1.1" />
+    </template>
+    <template v-else-if="props.name === 'logout'">
+      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+      <path d="m16 17 5-5-5-5" />
+      <path d="M21 12H9" />
     </template>
     <template v-else-if="props.name === 'paperclip'">
       <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />

@@ -4,6 +4,10 @@ import crypto from 'node:crypto'
 import { DATA_DIR } from './paths.js'
 import { bus } from './bus.js'
 import { publicConfig } from './config.js'
+import { detectProjectProfile } from './projectProfile.js'
+import { loadAppState, saveAppState } from './auth/db.js'
+import { getFirstUserId } from './auth/users.js'
+import { listTeamsForUser } from './teams.js'
 
 const STATE_FILE = path.join(DATA_DIR, 'state.json')
 
@@ -14,26 +18,64 @@ export const db = {
 
 const MAX_LOG_ENTRIES = 300
 
-function load() {
+export async function initStore() {
+  let loadedFromDb = false
   try {
-    const raw = fs.readFileSync(STATE_FILE, 'utf8')
-    const data = JSON.parse(raw)
-    if (data && Array.isArray(data.requirements)) {
-      db.requirements = data.requirements
+    const saved = await loadAppState()
+    if (saved) {
+      if (Array.isArray(saved.requirements)) db.requirements = saved.requirements
+      if (Array.isArray(saved.projects)) db.projects = saved.projects
+      loadedFromDb = true
     }
-    if (data && Array.isArray(data.projects)) {
-      db.projects = data.projects
+  } catch (err) {
+    console.warn('[store] 从 MySQL 读取状态失败:', err?.message)
+  }
+
+  if (!loadedFromDb) {
+    try {
+      const raw = fs.readFileSync(STATE_FILE, 'utf8')
+      const data = JSON.parse(raw)
+      if (data && Array.isArray(data.requirements)) db.requirements = data.requirements
+      if (data && Array.isArray(data.projects)) db.projects = data.projects
+    } catch {
+      db.requirements = []
+      db.projects = []
     }
-  } catch {
-    db.requirements = []
-    db.projects = []
   }
 
   let migrated = false
   for (const project of db.projects) {
     if (ensureProjectDeploy(project)) migrated = true
+    if (ensureProjectMeta(project)) migrated = true
+    if (!Array.isArray(project.teamIds)) {
+      project.teamIds = []
+      migrated = true
+    }
+    if (!Array.isArray(project.userIds)) {
+      project.userIds = []
+      migrated = true
+    }
   }
+
+  try {
+    const firstUserId = await getFirstUserId()
+    if (firstUserId) {
+      for (const project of db.projects) {
+        if (!project.ownerId) {
+          project.ownerId = firstUserId
+          migrated = true
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[store] 迁移项目归属失败:', err?.message)
+  }
+
   if (migrated) persist(true)
+  // 首次从文件迁移时，把现有状态写入 MySQL
+  if (!loadedFromDb && (db.projects.length || db.requirements.length)) {
+    persist(true)
+  }
 }
 
 let saveTimer = null
@@ -53,28 +95,85 @@ export function persist(immediate = false) {
     } catch (err) {
       console.warn('[store] 保存状态失败:', err?.message)
     }
+    saveAppState({ requirements: db.requirements, projects: db.projects }).catch((err) => {
+      console.warn('[store] 保存状态到 MySQL 失败:', err?.message)
+    })
   }
   if (immediate) run()
   else saveTimer = setTimeout(run, 400)
 }
 
-export function publicState() {
+let runtimeProvider = () => ({})
+
+/** 运行状态由 runner 提供，避免 store / runner 互相依赖 */
+export function setRuntimeProvider(provider) {
+  if (typeof provider === 'function') runtimeProvider = provider
+}
+
+export function canAccessProject(project, user) {
+  if (!project || !user) return false
+  if (!project.ownerId) return true
+  if (project.ownerId === user.id) return true
+  if (Array.isArray(project.teamIds) && Array.isArray(user.teamIds)) {
+    if (project.teamIds.some((teamId) => user.teamIds.includes(teamId))) return true
+  }
+  if (Array.isArray(project.userIds) && project.userIds.includes(user.id)) return true
+  return false
+}
+
+export function publicProject(project, user) {
+  if (!project) return null
+  const isOwner = Boolean(user && project.ownerId === user.id)
+  const result = { ...project, isOwner }
+  if (!isOwner) {
+    delete result.deploy
+    delete result.teamIds
+    delete result.userIds
+    delete result.ownerId
+  }
+  return result
+}
+
+export async function publicState(user) {
+  if (!user) {
+    return {
+      requirements: [],
+      projects: [],
+      config: publicConfig(),
+      runtime: {},
+      teams: [],
+    }
+  }
+  const projects = db.projects
+    .filter((project) => canAccessProject(project, user))
+    .map((project) => publicProject(project, user))
+  const ids = new Set(projects.map((project) => project.id))
+  const requirements = db.requirements.filter((requirement) => ids.has(requirement.projectId))
+  const runtime = runtimeProvider()
+  let teams = []
+  try {
+    teams = await listTeamsForUser(user.id)
+  } catch {
+    teams = []
+  }
   return {
-    requirements: db.requirements,
-    projects: db.projects,
+    requirements,
+    projects,
     config: publicConfig(),
+    runtime: Object.fromEntries(
+      Object.entries(runtime || {}).filter(([projectId]) => ids.has(projectId)),
+    ),
+    teams,
   }
 }
 
 export function broadcastState() {
-  bus.emit('state', publicState())
+  bus.emit('state')
 }
 
 export function touch() {
-  persist()
+  persist(true)
 }
-
-load()
 
 export function findRequirement(id) {
   return db.requirements.find((r) => r.id === id)
@@ -164,12 +263,67 @@ function ensureProjectDeploy(project) {
   return changed
 }
 
-export function createProject({ name, path: projectPath, description = '' }) {
+export function normalizeProjectType(value, fallback = 'backend') {
+  return value === 'frontend' ? 'frontend' : value === 'backend' ? 'backend' : fallback
+}
+
+/** 老项目补齐类型 / 启动命令 / 预览地址，并尽量从 package.json 推断前端项目 */
+function ensureProjectMeta(project) {
+  let changed = false
+  const profile = detectProjectProfile(project.path)
+
+  if (project.type !== 'frontend' && project.type !== 'backend') {
+    project.type = profile.type
+    changed = true
+  }
+  if (typeof project.startCommand !== 'string') {
+    project.startCommand =
+      project.type === 'frontend' && !project.startCommand ? profile.startCommand : ''
+    changed = true
+  }
+  if (typeof project.previewUrl !== 'string') {
+    project.previewUrl =
+      project.type === 'frontend' && !project.previewUrl ? profile.previewUrl : ''
+    changed = true
+  }
+  if (typeof project.autoStart !== 'boolean') {
+    project.autoStart = true
+    changed = true
+  }
+  return changed
+}
+
+export function createProject({
+  name,
+  path: projectPath,
+  description = '',
+  type,
+  startCommand = '',
+  previewUrl = '',
+  autoStart = true,
+  ownerId = null,
+}) {
+  const pathValue = String(projectPath).trim()
+  const profile = detectProjectProfile(pathValue)
+  const projectType = normalizeProjectType(type, profile.type)
   const project = {
     id: crypto.randomUUID(),
     name: String(name).trim(),
-    path: String(projectPath).trim(),
+    path: pathValue,
     description: String(description || '').trim(),
+    type: projectType,
+    startCommand:
+      projectType === 'frontend'
+        ? String(startCommand || profile.startCommand || '').trim()
+        : String(startCommand || '').trim(),
+    previewUrl:
+      projectType === 'frontend'
+        ? String(previewUrl || profile.previewUrl || 'http://localhost:5173/').trim()
+        : '',
+    autoStart: autoStart !== false,
+    ownerId: ownerId ? String(ownerId) : null,
+    teamIds: [],
+    userIds: [],
     createdAt: Date.now(),
     updatedAt: Date.now(),
     deploy: defaultDeploy(),
@@ -190,12 +344,50 @@ export function setProjectDeploy(id, deploy) {
   return project
 }
 
+export function setProjectAccess(id, { teamIds = [], userIds = [] } = {}) {
+  const project = findProject(id)
+  if (!project) return null
+  project.teamIds = [...new Set(teamIds.map(String).filter(Boolean))]
+  project.userIds = [...new Set(userIds.map(String).filter(Boolean))]
+  project.updatedAt = Date.now()
+  touch()
+  broadcastState()
+  return project
+}
+
+export function removeTeamFromProjects(teamId) {
+  let changed = false
+  for (const project of db.projects) {
+    if (!Array.isArray(project.teamIds)) continue
+    const next = project.teamIds.filter((id) => id !== teamId)
+    if (next.length !== project.teamIds.length) {
+      project.teamIds = next
+      project.updatedAt = Date.now()
+      changed = true
+    }
+  }
+  if (changed) {
+    touch()
+    broadcastState()
+  }
+  return changed
+}
+
 export function updateProject(id, patch) {
   const project = findProject(id)
   if (!project) return null
   if (patch.name !== undefined) project.name = String(patch.name).trim()
   if (patch.path !== undefined) project.path = String(patch.path).trim()
   if (patch.description !== undefined) project.description = String(patch.description).trim()
+  if (patch.type !== undefined) project.type = normalizeProjectType(patch.type, project.type)
+  if (patch.startCommand !== undefined) project.startCommand = String(patch.startCommand).trim()
+  if (patch.previewUrl !== undefined) project.previewUrl = String(patch.previewUrl).trim()
+  if (patch.autoStart !== undefined) project.autoStart = Boolean(patch.autoStart)
+  if (project.type === 'frontend') {
+    if (!project.previewUrl) project.previewUrl = 'http://localhost:5173/'
+  } else {
+    project.previewUrl = ''
+  }
   project.updatedAt = Date.now()
   touch()
   broadcastState()

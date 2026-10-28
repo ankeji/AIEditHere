@@ -1,3 +1,4 @@
+import './env.js'
 import express from 'express'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -8,6 +9,8 @@ import { config, saveConfig, publicConfig } from './config.js'
 import {
   db,
   publicState,
+  publicProject,
+  canAccessProject,
   broadcastState,
   createRequirement,
   createProject,
@@ -15,13 +18,27 @@ import {
   removeProject,
   findProject,
   setProjectDeploy,
+  setProjectAccess,
+  removeTeamFromProjects,
   findRequirement,
   removeRequirement,
   recoverInterrupted,
   persist,
   touch,
+  setRuntimeProvider,
+  initStore,
 } from './store.js'
 import { ensureProjectPath, normalizeProjectPath } from './projectPath.js'
+import { detectProjectProfile } from './projectProfile.js'
+import {
+  runtimeSnapshot,
+  getProjectRuntime,
+  getProjectRunLogs,
+  startProject,
+  stopProject,
+  restartProject,
+  stopAllProjects,
+} from './runner.js'
 import { bus } from './bus.js'
 import * as oc from './opencode.js'
 import {
@@ -39,9 +56,26 @@ import {
   getDeployLogs,
 } from './deploy.js'
 import { WEB_DIST, DATA_DIR } from './paths.js'
+import { initAuthDb } from './auth/db.js'
+import { requireAuth } from './auth/middleware.js'
+import authRouter from './auth/routes.js'
+import { cleanupAuthData, getSessionUser } from './auth/service.js'
+import { findUserByEmail, getUsersByIds } from './auth/users.js'
+import {
+  listTeamsForUser,
+  isTeamOwner,
+  createTeam,
+  renameTeam,
+  deleteTeam,
+  addTeamMember,
+  removeTeamMember,
+  leaveTeam,
+} from './teams.js'
 
 const app = express()
 app.use(express.json({ limit: '2mb' }))
+
+setRuntimeProvider(runtimeSnapshot)
 
 const PORT = Number(process.env.PORT || 4400)
 
@@ -142,6 +176,32 @@ const asyncRoute = (fn) => (req, res, next) => {
   Promise.resolve(fn(req, res, next)).catch(next)
 }
 
+function accessibleProject(user, id) {
+  const project = findProject(id)
+  if (!project || !canAccessProject(project, user)) return null
+  return project
+}
+
+function requireAccessibleProject(user, id) {
+  const project = accessibleProject(user, id)
+  if (!project) throw new HttpError(404, '项目不存在')
+  return project
+}
+
+function requireOwnedProject(user, id) {
+  const project = findProject(id)
+  if (!project || project.ownerId !== user.id) throw new HttpError(404, '项目不存在')
+  return project
+}
+
+function requireAccessibleRequirement(user, id) {
+  const requirement = findRequirement(id)
+  if (!requirement) throw new HttpError(404, '需求不存在')
+  const project = accessibleProject(user, requirement.projectId)
+  if (!project) throw new HttpError(404, '需求不存在')
+  return requirement
+}
+
 app.get(
   '/api/health',
   asyncRoute(async (req, res) => {
@@ -150,9 +210,17 @@ app.get(
   }),
 )
 
+/* ------------------------------- 鉴权 ------------------------------- */
+
+app.use('/api/auth', authRouter)
+app.use('/api', (req, res, next) => {
+  if (req.path.startsWith('/auth/')) return next()
+  return requireAuth(req, res, next)
+})
+
 app.get('/api/state', asyncRoute(async (req, res) => {
   const health = await getHealth()
-  res.json({ ...publicState(), health })
+  res.json({ ...await publicState(req.user), health })
 }))
 
 app.put(
@@ -224,9 +292,15 @@ app.post('/api/requirements', (req, res) => {
   const text = String(req.body?.text || '').trim()
   if (!text) return res.status(400).json({ error: '需求内容不能为空' })
   if (text.length > 20000) return res.status(400).json({ error: '需求内容过长（最多 20000 字）' })
-  const projectId = String(req.body?.projectId || '') || null
-  if (projectId && !db.projects.some((p) => p.id === projectId)) {
-    return res.status(400).json({ error: '项目不存在' })
+  let projectId = String(req.body?.projectId || '') || null
+  if (projectId) {
+    if (!accessibleProject(req.user, projectId)) {
+      return res.status(400).json({ error: '项目不存在' })
+    }
+  } else {
+    const first = db.projects.find((project) => canAccessProject(project, req.user))
+    if (!first) return res.status(400).json({ error: '请先创建项目' })
+    projectId = first.id
   }
   const requirement = createRequirement(text, projectId)
   res.status(201).json(requirement)
@@ -235,7 +309,10 @@ app.post('/api/requirements', (req, res) => {
 /* ----------------------------- 项目管理 ----------------------------- */
 
 app.get('/api/projects', (req, res) => {
-  res.json({ projects: db.projects })
+  const projects = db.projects
+    .filter((project) => canAccessProject(project, req.user))
+    .map((project) => publicProject(project, req.user))
+  res.json({ projects })
 })
 
 app.post('/api/projects', (req, res) => {
@@ -259,13 +336,17 @@ app.post('/api/projects', (req, res) => {
     name,
     path: info.path,
     description: req.body?.description,
+    type: req.body?.type,
+    startCommand: req.body?.startCommand,
+    previewUrl: req.body?.previewUrl,
+    autoStart: req.body?.autoStart,
+    ownerId: req.user.id,
   })
   res.status(201).json({ project, created: info.created })
 })
 
 app.patch('/api/projects/:id', (req, res) => {
-  const project = db.projects.find((p) => p.id === req.params.id)
-  if (!project) return res.status(404).json({ error: '项目不存在' })
+  const project = requireOwnedProject(req.user, req.params.id)
 
   const patch = {}
   if (req.body?.name !== undefined) {
@@ -281,31 +362,180 @@ app.patch('/api/projects/:id', (req, res) => {
     patch.path = info.path
   }
   if (req.body?.description !== undefined) patch.description = String(req.body.description)
+  if (req.body?.type !== undefined) patch.type = req.body.type
+  if (req.body?.startCommand !== undefined) patch.startCommand = String(req.body.startCommand)
+  if (req.body?.previewUrl !== undefined) patch.previewUrl = String(req.body.previewUrl)
+  if (req.body?.autoStart !== undefined) patch.autoStart = Boolean(req.body.autoStart)
+
+  if (patch.path && patch.path !== project.path) {
+    const profile = detectProjectProfile(patch.path)
+    if (patch.type === undefined && project.type !== 'frontend' && profile.type === 'frontend') {
+      patch.type = 'frontend'
+      if (patch.startCommand === undefined) patch.startCommand = profile.startCommand
+      if (patch.previewUrl === undefined) patch.previewUrl = profile.previewUrl
+    }
+  }
+
+  if (patch.type === 'backend' && project.type === 'frontend') {
+    stopProject(project.id)
+  }
 
   const updated = updateProject(project.id, patch)
   res.json(updated)
 })
 
 app.delete('/api/projects/:id', (req, res) => {
-  const project = db.projects.find((p) => p.id === req.params.id)
-  if (!project) return res.status(404).json({ error: '项目不存在' })
+  const project = requireOwnedProject(req.user, req.params.id)
+  stopProject(project.id)
   removeProject(project.id)
   res.json({ ok: true })
 })
 
+/* ------------------------------- 团队 ------------------------------- */
+
+app.get('/api/teams', asyncRoute(async (req, res) => {
+  res.json({ teams: await listTeamsForUser(req.user.id) })
+}))
+
+app.post('/api/teams', asyncRoute(async (req, res) => {
+  const name = String(req.body?.name || '').trim()
+  if (!name) throw new HttpError(400, '团队名称不能为空')
+  if (name.length > 80) throw new HttpError(400, '团队名称不能超过 80 个字符')
+  const team = await createTeam(req.user.id, name)
+  res.status(201).json({ team })
+}))
+
+app.patch('/api/teams/:id', asyncRoute(async (req, res) => {
+  if (!(await isTeamOwner(req.params.id, req.user.id))) throw new HttpError(404, '团队不存在')
+  const name = String(req.body?.name || '').trim()
+  if (!name) throw new HttpError(400, '团队名称不能为空')
+  if (name.length > 80) throw new HttpError(400, '团队名称不能超过 80 个字符')
+  res.json({ team: await renameTeam(req.params.id, name) })
+}))
+
+app.delete('/api/teams/:id', asyncRoute(async (req, res) => {
+  if (!(await isTeamOwner(req.params.id, req.user.id))) throw new HttpError(404, '团队不存在')
+  await deleteTeam(req.params.id)
+  removeTeamFromProjects(req.params.id)
+  broadcastState()
+  res.json({ ok: true })
+}))
+
+app.post('/api/teams/:id/members', asyncRoute(async (req, res) => {
+  if (!(await isTeamOwner(req.params.id, req.user.id))) throw new HttpError(404, '团队不存在')
+  const email = String(req.body?.email || '').trim()
+  if (!email) throw new HttpError(400, '请填写成员邮箱')
+  const team = await addTeamMember(req.params.id, email)
+  broadcastState()
+  res.status(201).json({ team })
+}))
+
+app.delete('/api/teams/:id/members/:userId', asyncRoute(async (req, res) => {
+  if (!(await isTeamOwner(req.params.id, req.user.id))) throw new HttpError(404, '团队不存在')
+  const team = await removeTeamMember(req.params.id, req.params.userId)
+  broadcastState()
+  res.json({ team })
+}))
+
+app.post('/api/teams/:id/leave', asyncRoute(async (req, res) => {
+  await leaveTeam(req.params.id, req.user.id)
+  broadcastState()
+  res.json({ ok: true })
+}))
+
+app.get('/api/users/lookup', asyncRoute(async (req, res) => {
+  const email = String(req.query.email || '').trim()
+  if (!email) throw new HttpError(400, '请填写邮箱')
+  const user = await findUserByEmail(email)
+  if (!user) throw new HttpError(404, '该邮箱还没有注册账号')
+  res.json({ user })
+}))
+
+/* --------------------------- 项目可见范围 --------------------------- */
+
+app.get('/api/projects/:id/access', asyncRoute(async (req, res) => {
+  const project = requireOwnedProject(req.user, req.params.id)
+  const users = await getUsersByIds(project.userIds || [])
+  res.json({ teamIds: project.teamIds || [], users })
+}))
+
+app.put('/api/projects/:id/access', asyncRoute(async (req, res) => {
+  const project = requireOwnedProject(req.user, req.params.id)
+  const rawTeamIds = Array.isArray(req.body?.teamIds) ? req.body.teamIds : []
+  const rawUserIds = Array.isArray(req.body?.userIds) ? req.body.userIds : []
+  const teamIds = [...new Set(rawTeamIds.map(String).filter(Boolean))]
+  const userIds = [...new Set(rawUserIds.map(String).filter(Boolean))]
+  if (teamIds.length > 100 || userIds.length > 500) {
+    throw new HttpError(400, '共享范围过大')
+  }
+
+  const myTeams = await listTeamsForUser(req.user.id)
+  const myTeamIds = new Set(myTeams.map((team) => team.id))
+  if (teamIds.some((id) => !myTeamIds.has(id))) {
+    throw new HttpError(400, '包含无效的团队')
+  }
+
+  const users = await getUsersByIds(userIds)
+  if (users.length !== userIds.length) throw new HttpError(400, '包含无效的用户')
+
+  const updated = setProjectAccess(project.id, { teamIds, userIds })
+  res.json({ teamIds: updated.teamIds, userIds: updated.userIds, users })
+}))
+
+/* --------------------------- 前端项目运行 / 预览 --------------------------- */
+
+app.get('/api/projects/:id/run', (req, res, next) => {
+  const project = requireAccessibleProject(req.user, req.params.id)
+  res.json({
+    runtime: getProjectRuntime(project.id),
+    logs: getProjectRunLogs(project.id),
+  })
+})
+
+app.get('/api/projects/:id/run/logs', (req, res, next) => {
+  const project = requireAccessibleProject(req.user, req.params.id)
+  res.json({ logs: getProjectRunLogs(project.id) })
+})
+
+app.post('/api/projects/:id/start', (req, res, next) => {
+  const project = requireAccessibleProject(req.user, req.params.id)
+  if (project.type !== 'frontend') {
+    return next(new HttpError(400, '只有前端项目支持启动预览服务'))
+  }
+  try {
+    res.json(startProject(project))
+  } catch (err) {
+    next(err)
+  }
+})
+
+app.post('/api/projects/:id/stop', (req, res, next) => {
+  const project = requireAccessibleProject(req.user, req.params.id)
+  res.json(stopProject(project.id))
+})
+
+app.post(
+  '/api/projects/:id/restart',
+  asyncRoute(async (req, res, next) => {
+    const project = requireAccessibleProject(req.user, req.params.id)
+    if (project.type !== 'frontend') {
+      return next(new HttpError(400, '只有前端项目支持启动预览服务'))
+    }
+    res.json(await restartProject(project))
+  }),
+)
+
 /* -------------------------- 项目部署配置 & 部署 -------------------------- */
 
 app.put('/api/projects/:id/deploy', (req, res, next) => {
-  const project = findProject(req.params.id)
-  if (!project) return next(new HttpError(404, '项目不存在'))
+  const project = requireOwnedProject(req.user, req.params.id)
   const deploy = normalizeDeploy(req.body || {}, project)
   const updated = setProjectDeploy(project.id, deploy)
   res.json({ project: updated })
 })
 
 app.post('/api/projects/:id/deploy/:envId', (req, res, next) => {
-  const project = findProject(req.params.id)
-  if (!project) return next(new HttpError(404, '项目不存在'))
+  const project = requireOwnedProject(req.user, req.params.id)
   const env = (project.deploy?.environments || []).find((item) => item.id === req.params.envId)
   if (!env) return next(new HttpError(404, '部署环境不存在'))
   if (isEnvDeploying(project.id, env.id) || env.lastStatus === 'running') {
@@ -320,8 +550,7 @@ app.post('/api/projects/:id/deploy/:envId', (req, res, next) => {
 })
 
 app.post('/api/projects/:id/deploy/:envId/abort', (req, res, next) => {
-  const project = findProject(req.params.id)
-  if (!project) return next(new HttpError(404, '项目不存在'))
+  const project = requireOwnedProject(req.user, req.params.id)
   const env = (project.deploy?.environments || []).find((item) => item.id === req.params.envId)
   if (!env) return next(new HttpError(404, '部署环境不存在'))
   const ok = abortEnvDeploy(project, env)
@@ -329,24 +558,21 @@ app.post('/api/projects/:id/deploy/:envId/abort', (req, res, next) => {
 })
 
 app.get('/api/projects/:id/deploy/:envId/logs', (req, res, next) => {
-  const project = findProject(req.params.id)
-  if (!project) return next(new HttpError(404, '项目不存在'))
+  const project = requireOwnedProject(req.user, req.params.id)
   const env = (project.deploy?.environments || []).find((item) => item.id === req.params.envId)
   if (!env) return next(new HttpError(404, '部署环境不存在'))
   res.json({ logs: getDeployLogs(project.id, env.id) })
 })
 
 app.delete('/api/requirements/:id', (req, res) => {
-  const req0 = findRequirement(req.params.id)
-  if (!req0) return res.status(404).json({ error: '需求不存在' })
+  const req0 = requireAccessibleRequirement(req.user, req.params.id)
   removeRequirementFiles(req0)
   removeRequirement(req.params.id)
   res.json({ ok: true })
 })
 
 app.post('/api/requirements/:id/split', (req, res, next) => {
-  const requirement = findRequirement(req.params.id)
-  if (!requirement) return next(new HttpError(404, '需求不存在'))
+  const requirement = requireAccessibleRequirement(req.user, req.params.id)
   if (requirement.status === 'splitting' || requirement.status === 'running') {
     return next(new HttpError(409, '该需求正在处理中'))
   }
@@ -358,8 +584,7 @@ app.post('/api/requirements/:id/split', (req, res, next) => {
 })
 
 app.post('/api/requirements/:id/execute', (req, res, next) => {
-  const requirement = findRequirement(req.params.id)
-  if (!requirement) return next(new HttpError(404, '需求不存在'))
+  const requirement = requireAccessibleRequirement(req.user, req.params.id)
   if (requirement.status === 'running' || requirement.status === 'splitting') {
     return next(new HttpError(409, '该需求正在执行中'))
   }
@@ -369,15 +594,13 @@ app.post('/api/requirements/:id/execute', (req, res, next) => {
 })
 
 app.post('/api/requirements/:id/abort', asyncRoute(async (req, res) => {
-  const requirement = findRequirement(req.params.id)
-  if (!requirement) throw new HttpError(404, '需求不存在')
+  const requirement = requireAccessibleRequirement(req.user, req.params.id)
   await abortRequirement(requirement.id)
   res.json({ ok: true })
 }))
 
 app.post('/api/requirements/:id/tasks/:taskId/retry', (req, res, next) => {
-  const requirement = findRequirement(req.params.id)
-  if (!requirement) return next(new HttpError(404, '需求不存在'))
+  const requirement = requireAccessibleRequirement(req.user, req.params.id)
   const task = requirement.tasks.find((item) => item.id === req.params.taskId)
   if (!task) return next(new HttpError(404, '任务不存在'))
   if (requirement.status === 'running' || requirement.status === 'splitting') {
@@ -425,6 +648,7 @@ app.get('/api/fs/inspect', (req, res) => {
   }
   let packageName = ''
   let isGit = false
+  let profile = null
   if (exists && isDir) {
     try {
       const pkg = JSON.parse(fs.readFileSync(path.join(resolved, 'package.json'), 'utf8'))
@@ -437,6 +661,7 @@ app.get('/api/fs/inspect', (req, res) => {
     } catch {
       /* 忽略 */
     }
+    profile = detectProjectProfile(resolved)
   }
   res.json({
     path: resolved,
@@ -445,6 +670,7 @@ app.get('/api/fs/inspect', (req, res) => {
     isDir,
     packageName,
     isGit,
+    profile,
   })
 })
 
@@ -527,8 +753,7 @@ app.post(
   '/api/requirements/:id/attachments',
   express.raw({ type: () => true, limit: '30mb' }),
   (req, res, next) => {
-    const requirement = findRequirement(req.params.id)
-    if (!requirement) return next(new HttpError(404, '需求不存在'))
+    const requirement = requireAccessibleRequirement(req.user, req.params.id)
     const buffer = Buffer.isBuffer(req.body) ? req.body : null
     if (!buffer || !buffer.length) return next(new HttpError(400, '文件内容为空'))
     const name = sanitizeFileName(req.query.name)
@@ -552,8 +777,7 @@ app.post(
 )
 
 app.get('/api/requirements/:id/attachments/:attId', (req, res, next) => {
-  const requirement = findRequirement(req.params.id)
-  if (!requirement) return next(new HttpError(404, '需求不存在'))
+  const requirement = requireAccessibleRequirement(req.user, req.params.id)
   const attachment = (requirement.attachments || []).find((item) => item.id === req.params.attId)
   if (!attachment || !fs.existsSync(attachment.path)) {
     return next(new HttpError(404, '附件不存在'))
@@ -562,8 +786,7 @@ app.get('/api/requirements/:id/attachments/:attId', (req, res, next) => {
 })
 
 app.delete('/api/requirements/:id/attachments/:attId', (req, res, next) => {
-  const requirement = findRequirement(req.params.id)
-  if (!requirement) return next(new HttpError(404, '需求不存在'))
+  const requirement = requireAccessibleRequirement(req.user, req.params.id)
   const index = (requirement.attachments || []).findIndex((item) => item.id === req.params.attId)
   if (index < 0) return next(new HttpError(404, '附件不存在'))
   const [attachment] = requirement.attachments.splice(index, 1)
@@ -616,9 +839,49 @@ app.get('/api/events', (req, res) => {
   res.on('error', stop)
   req.on('error', stop)
 
-  send('state', publicState())
+  let currentUser = req.user
 
-  unsubscribe = bus.subscribe(({ type, data }) => send(type, data))
+  const refreshUser = async () => {
+    try {
+      const latest = await getSessionUser(req)
+      if (latest) currentUser = latest
+    } catch {
+      /* 使用当前会话信息 */
+    }
+  }
+
+  const sendState = async () => {
+    await refreshUser()
+    send('state', await publicState(currentUser))
+  }
+
+  const canReceive = (type, data) => {
+    if (type === 'state' || type === 'health' || type === 'toast') return true
+    if (type === 'log') {
+      const requirement = findRequirement(data?.requirementId)
+      const project = requirement ? findProject(requirement.projectId) : null
+      return canAccessProject(project, currentUser)
+    }
+    if (type === 'run-log' || type === 'run-status') {
+      return canAccessProject(findProject(data?.projectId), currentUser)
+    }
+    if (type === 'deploy-log' || type === 'deploy-status') {
+      const project = findProject(data?.projectId)
+      return Boolean(project && project.ownerId === currentUser.id)
+    }
+    return true
+  }
+
+  sendState()
+
+  unsubscribe = bus.subscribe(({ type, data }) => {
+    if (type === 'state') {
+      sendState()
+      return
+    }
+    if (!canReceive(type, data)) return
+    send(type, data)
+  })
   heartbeat = setInterval(() => {
     if (closed || res.destroyed || res.writableEnded) return stop()
     try {
@@ -657,27 +920,37 @@ app.use((err, req, res, next) => {
 
 process.on('SIGINT', () => {
   if (opencodeProcess) opencodeProcess.kill()
+  stopAllProjects()
   persist(true)
   process.exit(0)
 })
 process.on('SIGTERM', () => {
   if (opencodeProcess) opencodeProcess.kill()
+  stopAllProjects()
   persist(true)
   process.exit(0)
 })
 
+try {
+  const dbInfo = await initAuthDb()
+  console.log(`[auth] MySQL 已连接：${dbInfo.user}@${dbInfo.host}:${dbInfo.port}/${dbInfo.database}`)
+  await cleanupAuthData()
+  setInterval(() => {
+    cleanupAuthData().catch(() => {})
+  }, 6 * 3600 * 1000).unref()
+  await initStore()
+} catch (err) {
+  console.error('\n[auth] MySQL 初始化失败：', err?.message || err)
+  console.error('请检查根目录 .env 中的 MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DATABASE。')
+  console.error('也可以参考 .env.example 的配置说明。\n')
+  process.exit(1)
+}
+
 recoverInterrupted()
 
-/** 首次启动时创建一个默认项目，并把历史需求归入该项目 */
+/** 把历史需求归入已有项目；不再自动创建公共默认项目 */
 function ensureDefaultProject() {
-  if (!db.projects.length) {
-    const project = createProject({
-      name: '默认项目',
-      path: config.projectDir,
-      description: '自动创建，可以随时改名或换目录',
-    })
-    console.log(`[project] 已创建默认项目：${project.name}（${project.path}）`)
-  }
+  if (!db.projects.length) return
   let changed = false
   for (const requirement of db.requirements) {
     if (!requirement.projectId) {
@@ -691,7 +964,7 @@ function ensureDefaultProject() {
 ensureDefaultProject()
 
 app.listen(PORT, async () => {
-  console.log(`\n  AutoCode 服务已启动: http://localhost:${PORT}`)
+  console.log(`\n  AIEditHere 服务已启动: http://localhost:${PORT}`)
   console.log(`  opencode 服务地址: ${config.opencodeUrl}${config.demo ? '（演示模式）' : ''}`)
   if (!config.demo && !fs.existsSync(WEB_DIST)) {
     console.log('  提示：前端开发模式请运行 npm run dev，然后访问 http://localhost:5173')

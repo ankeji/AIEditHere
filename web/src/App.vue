@@ -1,11 +1,14 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import AppIcon from './components/AppIcon.vue'
 import ProjectsView from './components/ProjectsView.vue'
-import WorkspaceView from './components/WorkspaceView.vue'
+import WorkspaceShell from './components/WorkspaceShell.vue'
 import SettingsDialog from './components/SettingsDialog.vue'
 import ProjectDialog from './components/ProjectDialog.vue'
 import DeployDialog from './components/DeployDialog.vue'
+import TeamDialog from './components/TeamDialog.vue'
+import ProjectAccessDialog from './components/ProjectAccessDialog.vue'
+import LoginView from './components/LoginView.vue'
 import {
   store,
   loadState,
@@ -14,26 +17,66 @@ import {
   reconnectOpencode,
   saveConfig,
   initRouter,
+  initAuth,
+  logoutAccount,
   backToProjects,
   currentProject,
   openDeployDialog,
+  openTeamDialog,
 } from './lib/store.js'
 import { ltr } from './lib/format.js'
 
 let timer = null
+let sessionStarted = false
+const userMenuOpen = ref(false)
 
 onMounted(async () => {
   initRouter()
-  await loadState()
-  connectEvents()
-  timer = setInterval(refreshHealth, 15000)
+  await initAuth()
 })
 
 onBeforeUnmount(() => {
   if (timer) clearInterval(timer)
 })
 
+watch(
+  () => store.auth.user,
+  (user) => {
+    if (user) startSession()
+    else stopSession()
+  },
+  { immediate: true },
+)
+
+async function startSession() {
+  if (sessionStarted) return
+  sessionStarted = true
+  await loadState()
+  connectEvents()
+  refreshHealth()
+  if (timer) clearInterval(timer)
+  timer = setInterval(refreshHealth, 15000)
+}
+
+function stopSession() {
+  sessionStarted = false
+  userMenuOpen.value = false
+  if (timer) {
+    clearInterval(timer)
+    timer = null
+  }
+}
+
 const project = computed(() => currentProject())
+
+const userInitial = computed(() => {
+  const user = store.auth.user
+  if (!user) return '?'
+  const source = user.name || user.email || ''
+  return source.trim().charAt(0).toUpperCase() || '?'
+})
+
+const userLabel = computed(() => store.auth.user?.name || store.auth.user?.email || '')
 
 const connectionState = computed(() => {
   if (store.config.demo) return { kind: 'demo', label: '演示模式' }
@@ -58,10 +101,22 @@ function enableDemo() {
 function disableDemo() {
   saveConfig({ demo: false })
 }
+
+async function signOut() {
+  userMenuOpen.value = false
+  await logoutAccount()
+}
 </script>
 
 <template>
-  <div class="app">
+  <div v-if="!store.auth.ready" class="auth-boot">
+    <span class="spinner" />
+    正在检查登录状态…
+  </div>
+
+  <LoginView v-else-if="!store.auth.user" />
+
+  <div v-else class="app">
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark">
@@ -69,7 +124,7 @@ function disableDemo() {
         </span>
         <div class="brand-text">
           <div class="brand-name">
-            AutoCode
+            AIEditHere
             <span class="brand-tag">opencode 控制台</span>
           </div>
           <div v-if="project" class="brand-sub">
@@ -78,6 +133,9 @@ function disableDemo() {
               项目
             </button>
             <span class="project-name">{{ project.name }}</span>
+            <span class="project-type" :class="project.type || 'backend'">
+              {{ project.type === 'frontend' ? '前端' : '后端' }}
+            </span>
             <span class="project-path" :title="project.path">{{ ltr(project.path) }}</span>
           </div>
           <div v-else class="brand-sub">
@@ -92,14 +150,39 @@ function disableDemo() {
           <span class="dot" />
           {{ connectionState.label }}
         </span>
-        <button v-if="project" class="btn btn-ghost btn-sm" @click="openDeployDialog(project)">
+        <button v-if="project && project.isOwner" class="btn btn-ghost btn-sm" @click="openDeployDialog(project)">
           <AppIcon name="upload" :size="14" />
           部署
+        </button>
+        <button class="btn btn-ghost btn-sm" @click="openTeamDialog">
+          <AppIcon name="users" :size="14" />
+          我的团队
         </button>
         <button class="btn btn-ghost btn-sm" @click="store.settingsOpen = true">
           <AppIcon name="gear" :size="14" />
           设置
         </button>
+        <div class="user-wrap">
+          <button class="user-chip" type="button" @click="userMenuOpen = !userMenuOpen">
+            <span class="avatar">{{ userInitial }}</span>
+            <span class="user-label">{{ userLabel }}</span>
+            <AppIcon name="chevron" :size="12" :stroke="2.2" class="user-caret" />
+          </button>
+          <div v-if="userMenuOpen" class="user-backdrop" @click="userMenuOpen = false" />
+          <div v-if="userMenuOpen" class="user-popover" @click.stop>
+            <div class="user-card">
+              <span class="avatar large">{{ userInitial }}</span>
+              <div class="user-card-text">
+                <div class="user-card-name">{{ store.auth.user.name || 'AIEditHere 用户' }}</div>
+                <div class="user-card-email">{{ store.auth.user.email }}</div>
+              </div>
+            </div>
+            <button class="user-logout" type="button" @click="signOut">
+              <AppIcon name="logout" :size="14" />
+              退出登录
+            </button>
+          </div>
+        </div>
       </div>
     </header>
 
@@ -126,11 +209,13 @@ function disableDemo() {
     </div>
 
     <ProjectsView v-if="store.route.view === 'projects'" />
-    <WorkspaceView v-else />
+    <WorkspaceShell v-else />
 
     <SettingsDialog />
     <ProjectDialog />
     <DeployDialog />
+    <TeamDialog />
+    <ProjectAccessDialog />
 
     <div class="toasts">
       <transition-group name="toast">
@@ -244,6 +329,25 @@ function disableDemo() {
   white-space: nowrap;
 }
 
+.project-type {
+  flex: none;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 4px;
+  padding: 0 5px;
+  line-height: 1.7;
+}
+
+.project-type.frontend {
+  color: var(--green-dark);
+  background: var(--green-soft);
+}
+
+.project-type.backend {
+  color: #3a5a86;
+  background: var(--blue-soft);
+}
+
 .project-path {
   max-width: 380px;
   overflow: hidden;
@@ -259,6 +363,137 @@ function disableDemo() {
   align-items: center;
   gap: 10px;
   flex: none;
+}
+
+.auth-boot {
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.user-wrap {
+  position: relative;
+  flex: none;
+}
+
+.user-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 210px;
+  padding: 3px 8px 3px 3px;
+  border: 1px solid var(--border);
+  background: #fff;
+  border-radius: 99px;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.user-chip:hover {
+  border-color: #c8dfd3;
+  background: #fbfffd;
+}
+
+.avatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #4cc693, #2c9d6e);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+
+.avatar.large {
+  width: 36px;
+  height: 36px;
+  font-size: 15px;
+}
+
+.user-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-soft);
+}
+
+.user-caret {
+  color: #9aa4b2;
+  flex: none;
+}
+
+.user-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 55;
+}
+
+.user-popover {
+  position: absolute;
+  right: 0;
+  top: 40px;
+  width: 260px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  box-shadow: 0 18px 50px -16px rgba(15, 23, 32, 0.4);
+  padding: 10px;
+  z-index: 60;
+}
+
+.user-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 6px 11px;
+  border-bottom: 1px solid var(--border);
+}
+
+.user-card-text {
+  min-width: 0;
+}
+
+.user-card-name {
+  font-size: 13px;
+  font-weight: 650;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-card-email {
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-logout {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 6px;
+  padding: 8px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  color: var(--red);
+  text-align: left;
+}
+
+.user-logout:hover {
+  background: var(--red-soft);
 }
 
 .conn-chip {

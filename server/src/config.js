@@ -12,7 +12,7 @@ const DEFAULTS = {
   /** agent，留空使用默认 agent */
   agent: process.env.OPENCODE_AGENT || '',
   /** 被控制的目标项目目录 */
-  projectDir: process.env.AUTOCODE_PROJECT || ROOT_DIR,
+  projectDir: process.env.AIEDITHERE_PROJECT || ROOT_DIR,
   /** 连接不到时自动执行 opencode serve */
   autoStart: true,
   /** 演示模式：不调用 opencode，本地模拟拆解与执行 */
