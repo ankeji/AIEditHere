@@ -5,3 +5,6 @@ server/data/*.json.tmp
 .DS_Store
 *.log
 .env
+
+# WorkBuddy 本地会话/记忆目录
+.workbuddy/
