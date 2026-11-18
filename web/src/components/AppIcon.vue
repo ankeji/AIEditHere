@@ -194,6 +194,13 @@ const props = defineProps({
       <path d="m7 11 5 5 5-5" />
       <path d="M20 20H4" />
     </template>
+    <template v-else-if="props.name === 'camera'">
+      <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+      <circle cx="12" cy="13" r="4" />
+    </template>
+    <template v-else-if="props.name === 'pointer'">
+      <path d="m4 3 7 17 2.5-7.5L21 10z" />
+    </template>
     <template v-else>
       <circle cx="12" cy="12" r="9" />
     </template>

@@ -56,9 +56,11 @@ import {
   getDeployLogs,
 } from './deploy.js'
 import { WEB_DIST, DATA_DIR } from './paths.js'
+import { syncCustomProvider } from './opencodeConfig.js'
 import { initAuthDb } from './auth/db.js'
 import { requireAuth } from './auth/middleware.js'
 import authRouter from './auth/routes.js'
+import modelRouter from './auth/modelRoutes.js'
 import { cleanupAuthData, getSessionUser } from './auth/service.js'
 import { findUserByEmail, getUsersByIds } from './auth/users.js'
 import {
@@ -71,6 +73,11 @@ import {
   removeTeamMember,
   leaveTeam,
 } from './teams.js'
+import {
+  ensureProjectPreviewProxy,
+  closeProjectPreviewProxy,
+  closeAllPreviewProxies,
+} from './preview-proxy.js'
 
 const app = express()
 app.use(express.json({ limit: '2mb' }))
@@ -160,6 +167,23 @@ function spawnOpencode() {
   }
 }
 
+/**
+ * 写入 opencode 配置后，尽力触发配置重载（不同版本端点不同，失败可忽略）。
+ * 如果 opencode 支持热加载配置，会在下次请求前生效；老版本可能需要手动重启。
+ */
+async function nudgeOpencodeReload() {
+  const base = config.opencodeUrl.replace(/\/+$/, '')
+  const attempts = ['/api/location/reload', '/instance/reload']
+  for (const path of attempts) {
+    try {
+      const res = await fetch(base + path, { method: 'POST' })
+      if (res.ok) return
+    } catch {
+      /* 忽略，尝试下一个 */
+    }
+  }
+}
+
 async function waitForHealth(maxMs = 20000) {
   const started = Date.now()
   while (Date.now() - started < maxMs) {
@@ -213,6 +237,7 @@ app.get(
 /* ------------------------------- 鉴权 ------------------------------- */
 
 app.use('/api/auth', authRouter)
+app.use('/api', modelRouter)
 app.use('/api', (req, res, next) => {
   if (req.path.startsWith('/auth/')) return next()
   return requireAuth(req, res, next)
@@ -227,7 +252,27 @@ app.put(
   '/api/config',
   asyncRoute(async (req, res) => {
     const before = { ...config }
-    const next = saveConfig(req.body || {})
+    const patch = { ...(req.body || {}) }
+    if (patch.apiKey === '••••••••') delete patch.apiKey
+    const next = saveConfig(patch)
+    if (
+      next.apiBaseUrl !== before.apiBaseUrl ||
+      next.apiModelName !== before.apiModelName ||
+      next.apiKey !== before.apiKey
+    ) {
+      try {
+        syncCustomProvider()
+      } catch (err) {
+        try {
+          saveConfig(before)
+        } catch {
+          Object.assign(config, before)
+        }
+        throw new HttpError(500, `写入 opencode 模型配置失败：${err.message}`)
+      }
+      oc.invalidateModelCatalog?.()
+      await nudgeOpencodeReload()
+    }
 
     if (next.opencodeUrl !== before.opencodeUrl || next.projectDir !== before.projectDir) {
       for (const requirement of db.requirements) requirement.sessionId = null
@@ -288,6 +333,59 @@ app.get('/api/opencode/models', asyncRoute(async (req, res) => {
   }
 }))
 
+app.post('/api/opencode/test-model', asyncRoute(async (req, res) => {
+  const baseUrl = String(req.body?.apiBaseUrl || '').trim().replace(/\/+$/, '')
+  const model = String(req.body?.apiModelName || '').trim()
+  const apiKey = String(req.body?.apiKey || '').trim() || config.apiKey
+  if (!baseUrl) throw new HttpError(400, '请填写 API 地址')
+  if (!model) throw new HttpError(400, '请填写模型名称')
+  const target = /\/chat\/completions$/i.test(baseUrl)
+    ? baseUrl
+    : `${baseUrl}${/\/v1$/i.test(baseUrl) ? '' : '/v1'}/chat/completions`
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 20000)
+  try {
+    const resp = await fetch(target, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: 'Explain quantum entanglement in one paragraph.' }],
+        temperature: 0.7,
+      }),
+      signal: controller.signal,
+    })
+    const text = await resp.text()
+    let data = null
+    try {
+      data = text ? JSON.parse(text) : null
+    } catch {
+      data = null
+    }
+    if (!resp.ok) {
+      const detail = data?.error?.message || (text ? text.slice(0, 300) : '空响应')
+      return res.json({ ok: false, error: `接口返回 ${resp.status}：${detail}`, models: config.apiModels || [] })
+    }
+    const reply = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? ''
+    res.json({
+      ok: true,
+      model,
+      reply: String(reply).slice(0, 200),
+      models: [...new Set([...(config.apiModels || []), model])],
+      error: null,
+    })
+  } catch (err) {
+    const message = err?.name === 'AbortError' ? '请求超时（20 秒）' : err?.cause?.message || err?.message || String(err)
+    res.json({ ok: false, models: config.apiModels || [], error: `无法连接模型接口：${message}` })
+  } finally {
+    clearTimeout(timer)
+  }
+}))
+
 app.post('/api/requirements', (req, res) => {
   const text = String(req.body?.text || '').trim()
   if (!text) return res.status(400).json({ error: '需求内容不能为空' })
@@ -302,7 +400,7 @@ app.post('/api/requirements', (req, res) => {
     if (!first) return res.status(400).json({ error: '请先创建项目' })
     projectId = first.id
   }
-  const requirement = createRequirement(text, projectId)
+  const requirement = createRequirement(text, projectId, req.user.id)
   res.status(201).json(requirement)
 })
 
@@ -387,6 +485,7 @@ app.patch('/api/projects/:id', (req, res) => {
 app.delete('/api/projects/:id', (req, res) => {
   const project = requireOwnedProject(req.user, req.params.id)
   stopProject(project.id)
+  closeProjectPreviewProxy(project.id).catch(() => {})
   removeProject(project.id)
   res.json({ ok: true })
 })
@@ -496,6 +595,19 @@ app.get('/api/projects/:id/run/logs', (req, res, next) => {
   const project = requireAccessibleProject(req.user, req.params.id)
   res.json({ logs: getProjectRunLogs(project.id) })
 })
+
+app.get(
+  '/api/projects/:id/preview-proxy',
+  asyncRoute(async (req, res, next) => {
+    const project = requireAccessibleProject(req.user, req.params.id)
+    if (!String(project.previewUrl || '').trim()) {
+      return next(new HttpError(400, '项目还没有配置预览地址'))
+    }
+    const url = await ensureProjectPreviewProxy(project)
+    if (!url) return next(new HttpError(400, '预览地址无效'))
+    res.json({ url, target: project.previewUrl })
+  }),
+)
 
 app.post('/api/projects/:id/start', (req, res, next) => {
   const project = requireAccessibleProject(req.user, req.params.id)
@@ -947,6 +1059,14 @@ try {
 }
 
 recoverInterrupted()
+
+// 启动时把统一配置的自定义模型同步进 opencode 配置
+try {
+  const { file, applied } = syncCustomProvider()
+  console.log(`[opencode] 模型配置已同步：${file}${applied ? '（自定义 API）' : ''}`)
+} catch (err) {
+  console.warn('[opencode] 同步自定义模型配置失败：', err?.message || err)
+}
 
 /** 把历史需求归入已有项目；不再自动创建公共默认项目 */
 function ensureDefaultProject() {

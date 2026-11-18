@@ -9,6 +9,9 @@ export const store = reactive({
   teamsLoaded: false,
   config: {
     opencodeUrl: '',
+    apiBaseUrl: '',
+    apiModelName: '',
+    apiKeyConfigured: false,
     model: '',
     agent: '',
     projectDir: '',
@@ -17,6 +20,7 @@ export const store = reactive({
   },
   health: { connected: false, demo: false, version: '' },
   runtime: {},
+  previewProxies: {},
   runLogs: {},
   selectedId: null,
   route: { view: 'projects', projectId: null },
@@ -26,6 +30,14 @@ export const store = reactive({
   deployDialog: { open: false, projectId: null },
   teamDialogOpen: false,
   accessDialog: { open: false, projectId: null },
+  aiEdit: {
+    projectId: null,
+    requirementId: null,
+    status: 'idle',
+    logs: [],
+    error: null,
+  },
+  aiQueues: {},
   deployLogs: {},
   eventSource: null,
 })
@@ -116,6 +128,7 @@ function resetSessionData() {
   store.teams = []
   store.teamsLoaded = false
   store.runtime = {}
+  store.previewProxies = {}
   store.runLogs = {}
   store.deployLogs = {}
   store.selectedId = null
@@ -125,6 +138,8 @@ function resetSessionData() {
   store.deployDialog = { open: false, projectId: null }
   store.teamDialogOpen = false
   store.accessDialog = { open: false, projectId: null }
+  store.aiEdit = { projectId: null, requirementId: null, status: 'idle', logs: [], error: null }
+  store.aiQueues = {}
   disconnectEvents()
   window.location.hash = '#/'
 }
@@ -186,7 +201,35 @@ function applyState(data) {
     closeAccessDialog()
   }
   syncSelection()
+  syncAiEditState()
+  syncAiQueues()
   store.ready = true
+}
+
+function appendAiEditLog(level, text) {
+  if (!text) return
+  const logs = store.aiEdit.logs
+  const last = logs[logs.length - 1]
+  if (
+    level === 'out' &&
+    last &&
+    last.level === 'out' &&
+    !last.text.endsWith('\n') &&
+    last.text.length + text.length < 6000
+  ) {
+    last.text += text
+  } else {
+    logs.push({ level, text })
+  }
+  while (logs.length > 600) logs.shift()
+}
+
+function syncAiEditState() {
+  if (!store.aiEdit.requirementId) return
+  const requirement = store.requirements.find((item) => item.id === store.aiEdit.requirementId)
+  if (!requirement) return
+  store.aiEdit.status = requirement.status || 'idle'
+  store.aiEdit.error = requirement.error || null
 }
 
 function appendLogEntry(requirementId, taskId, level, text) {
@@ -251,6 +294,10 @@ export function connectEvents() {
     try {
       const data = JSON.parse(event.data)
       appendLogEntry(data.requirementId, data.taskId, data.level, data.text)
+      if (store.aiEdit.requirementId && data.requirementId === store.aiEdit.requirementId) {
+        appendAiEditLog(data.level, data.text)
+      }
+      appendTaskLogByRequirement(data.requirementId, data.level, data.text)
     } catch {
       /* 忽略无效数据 */
     }
@@ -402,6 +449,37 @@ export async function loadRunLogs(projectId) {
   }
 }
 
+const previewProxyPending = new Map()
+
+export async function loadPreviewProxy(projectId) {
+  const project = store.projects.find((item) => item.id === projectId)
+  if (!project) return null
+  const target = String(project.previewUrl || '').trim()
+  if (!target) {
+    delete store.previewProxies[projectId]
+    return null
+  }
+  if (previewProxyPending.has(projectId)) return previewProxyPending.get(projectId)
+  const promise = api('GET', `/api/projects/${projectId}/preview-proxy`)
+    .then((data) => {
+      if (data?.url) {
+        store.previewProxies[projectId] = { url: data.url, target: data.target || target }
+        return data.url
+      }
+      store.previewProxies[projectId] = { url: '', target }
+      return null
+    })
+    .catch(() => {
+      store.previewProxies[projectId] = { url: '', target }
+      return null
+    })
+    .finally(() => {
+      previewProxyPending.delete(projectId)
+    })
+  previewProxyPending.set(projectId, promise)
+  return promise
+}
+
 /* ----------------------------- 选择器 ----------------------------- */
 
 export function currentProject() {
@@ -451,11 +529,11 @@ async function uploadAttachment(requirementId, file) {
   return data?.attachment
 }
 
-export async function addRequirement(text, files = []) {
+export async function addRequirement(text, files = [], projectId = store.route.projectId) {
   try {
     const requirement = await api('POST', '/api/requirements', {
       text,
-      projectId: store.route.projectId || undefined,
+      projectId: projectId || undefined,
     })
     store.selectedId = requirement.id
     if (files.length) {
@@ -528,6 +606,323 @@ export async function removeRequirement(id) {
   } catch (err) {
     pushToast(err.message, 'error')
   }
+}
+
+/* ----------------------------- 预览内 AI 修改 ----------------------------- */
+
+export function resetAiEdit(projectId = null) {
+  store.aiEdit = {
+    projectId,
+    requirementId: null,
+    status: 'idle',
+    logs: [],
+    error: null,
+  }
+}
+
+export async function startAiEdit({ projectId, text, files = [], onCreated }) {
+  if (!projectId) {
+    pushToast('请先打开一个项目', 'error')
+    return null
+  }
+  resetAiEdit(projectId)
+  store.aiEdit.status = 'creating'
+  appendAiEditLog('sys', '正在创建修改任务…\n')
+
+  const requirement = await addRequirement(text, files, projectId)
+  if (!requirement) {
+    store.aiEdit.status = 'failed'
+    appendAiEditLog('err', '✖ 创建修改任务失败\n')
+    return null
+  }
+
+  store.aiEdit.requirementId = requirement.id
+  store.aiEdit.status = 'splitting'
+  appendAiEditLog('sys', '正在分析需要修改的代码…\n')
+  if (typeof onCreated === 'function') onCreated(requirement)
+
+  await executeRequirement(requirement.id)
+  return requirement
+}
+
+export function projectAiQueue(projectId) {
+  if (!store.aiQueues[projectId]) {
+    store.aiQueues[projectId] = {
+      open: false,
+      stopped: false,
+      started: false,
+      items: [],
+      selectedId: null,
+    }
+  }
+  return store.aiQueues[projectId]
+}
+
+export function openAiQueue(projectId) {
+  projectAiQueue(projectId).open = true
+}
+
+export function closeAiQueue(projectId) {
+  const queue = projectAiQueue(projectId)
+  queue.open = false
+  queue.selectedId = null
+}
+
+export function selectAiTask(projectId, requirementId) {
+  const queue = projectAiQueue(projectId)
+  queue.selectedId = requirementId
+  queue.open = true
+}
+
+export function queueRequirements(projectId) {
+  return store.requirements
+    .filter((item) => item.projectId === projectId)
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+}
+
+const MAX_CONCURRENT_AI_TASKS = 2
+
+function appendTaskLogByRequirement(requirementId, level, text) {
+  if (!requirementId || !text) return
+  for (const projectId of Object.keys(store.aiQueues)) {
+    const queue = store.aiQueues[projectId]
+    if (!queue || !Array.isArray(queue.items)) continue
+    for (const item of queue.items) {
+      if (item.requirementId !== requirementId) continue
+      if (!item.logs) item.logs = []
+      const last = item.logs[item.logs.length - 1]
+      if (
+        level === 'out' &&
+        last &&
+        last.level === 'out' &&
+        !last.text.endsWith('\n') &&
+        last.text.length + text.length < 6000
+      ) {
+        last.text += text
+      } else {
+        item.logs.push({ level, text })
+      }
+      while (item.logs.length > 500) item.logs.shift()
+    }
+  }
+}
+
+function requirementOf(item) {
+  return store.requirements.find((r) => r.id === item.requirementId) || null
+}
+
+function syncAiQueueItem(item) {
+  const req = requirementOf(item)
+  if (!req) return false
+  item.requirementStatus = req.status
+  item.error = req.error || null
+  const tasks = Array.isArray(req.tasks) ? req.tasks : []
+  item.total = tasks.length
+  item.completed = tasks.filter((t) => t.status === 'done').length
+  item.failedCount = tasks.filter((t) => t.status === 'failed').length
+  item.runningTaskTitle = (tasks.find((t) => t.status === 'running') || {}).title || ''
+
+  if (item.status === 'aborted') return false
+
+  if (req.status === 'done') {
+    item.status = 'done'
+    item.finishedAt = Date.now()
+    return true
+  }
+  if (req.status === 'failed') {
+    item.status = 'failed'
+    item.finishedAt = Date.now()
+    return true
+  }
+  if (req.status === 'splitting') {
+    item.status = 'running'
+    item.phase = 'splitting'
+  } else if (req.status === 'running') {
+    item.status = 'running'
+    item.phase = 'executing'
+  } else if (req.status === 'split' || req.status === 'pending') {
+    item.status = 'running'
+    item.phase = 'pending'
+  }
+  return false
+}
+
+function syncAiQueues() {
+  for (const projectId of Object.keys(store.aiQueues)) {
+    const queue = store.aiQueues[projectId]
+    if (!queue || !Array.isArray(queue.items)) continue
+
+    for (const item of queue.items) {
+      if (!item.requirementId) continue
+      syncAiQueueItem(item)
+    }
+
+    const running = queue.items.filter((item) => item.status === 'running').length
+    const pending = queue.items.some((item) => item.status === 'pending')
+    if (!running && !pending) queue.started = false
+    if (queue.stopped) continue
+    if (queue.started && pending && running < MAX_CONCURRENT_AI_TASKS) {
+      processAiQueue(projectId)
+    }
+  }
+}
+
+function startAiQueueItem(projectId, item) {
+  if (!item || item.status !== 'pending') return
+  item.status = 'running'
+  item.phase = 'creating'
+  item.startedAt = Date.now()
+  item.finishedAt = null
+  item.error = null
+  item.logs = []
+  item.expanded = true
+
+  startAiEdit({
+    projectId,
+    text: item.text,
+    onCreated: (requirement) => {
+      item.requirementId = requirement.id
+      if (item.status === 'aborted') abortRequirement(requirement.id).catch(() => {})
+    },
+  })
+    .then((requirement) => {
+      if (requirement && item.status === 'aborted') {
+        abortRequirement(requirement.id).catch(() => {})
+        processAiQueue(projectId)
+        return
+      }
+      if (!requirement && item.status !== 'failed' && item.status !== 'aborted') {
+        item.status = 'failed'
+        item.error = item.error || '创建修改任务失败'
+        item.finishedAt = Date.now()
+        processAiQueue(projectId)
+        return
+      }
+      if (requirement && !item.requirementId) item.requirementId = requirement.id
+    })
+    .catch((err) => {
+      if (item.status === 'aborted') {
+        processAiQueue(projectId)
+        return
+      }
+      item.status = 'failed'
+      item.error = err?.message || '启动失败'
+      item.finishedAt = Date.now()
+      processAiQueue(projectId)
+    })
+}
+
+export function processAiQueue(projectId) {
+  if (!projectId) return
+  const queue = projectAiQueue(projectId)
+  if (!queue.started || queue.stopped) return
+  const running = queue.items.filter((item) => item.status === 'running').length
+  const slots = Math.max(0, MAX_CONCURRENT_AI_TASKS - running)
+  if (!slots) return
+  const pending = queue.items.filter((item) => item.status === 'pending').slice(0, slots)
+  for (const item of pending) startAiQueueItem(projectId, item)
+}
+
+export async function startQueuedAiTask({ projectId, text, instruction, element, elements, autoStart = false }) {
+  if (!projectId) {
+    pushToast('请先打开一个项目', 'error')
+    return null
+  }
+  const queue = projectAiQueue(projectId)
+  queue.open = true
+  if (autoStart) {
+    queue.started = true
+    queue.stopped = false
+  }
+
+  const list = Array.isArray(elements) && elements.length ? elements.slice() : element ? [element] : []
+  const item = {
+    id: `ai-task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    text,
+    instruction: instruction || '',
+    element: list[0] || null,
+    elements: list,
+    status: 'pending',
+    phase: 'pending',
+    requirementId: null,
+    requirementStatus: '',
+    error: null,
+    logs: [],
+    total: 0,
+    completed: 0,
+    failedCount: 0,
+    runningTaskTitle: '',
+    expanded: queue.items.length === 0,
+    createdAt: Date.now(),
+    startedAt: null,
+    finishedAt: null,
+  }
+  queue.items.push(item)
+  if (autoStart) processAiQueue(projectId)
+  return item
+}
+
+export function resumeAiQueue(projectId) {
+  if (!projectId) return
+  const queue = projectAiQueue(projectId)
+  queue.stopped = false
+  queue.started = true
+  processAiQueue(projectId)
+}
+
+export function stopAiQueue(projectId) {
+  if (!projectId) return
+  const queue = projectAiQueue(projectId)
+  queue.stopped = true
+  queue.started = false
+  for (const item of queue.items.filter((i) => i.status === 'running')) {
+    if (item.requirementId) abortRequirement(item.requirementId).catch(() => {})
+    item.status = 'aborted'
+    item.error = '已中止'
+    item.finishedAt = Date.now()
+  }
+}
+
+export function retryAiTask(projectId, itemId) {
+  if (!projectId || !itemId) return
+  const queue = projectAiQueue(projectId)
+  if (!queue) return
+  const item = queue.items.find((i) => i.id === itemId)
+  if (!item || item.status === 'running') return
+  item.status = 'pending'
+  item.phase = 'pending'
+  item.requirementId = null
+  item.requirementStatus = ''
+  item.error = null
+  item.logs = []
+  item.total = 0
+  item.completed = 0
+  item.failedCount = 0
+  item.runningTaskTitle = ''
+  item.startedAt = null
+  item.finishedAt = null
+  item.expanded = true
+  queue.stopped = false
+  queue.started = true
+  processAiQueue(projectId)
+}
+
+export function removeAiTask(projectId, itemId) {
+  if (!projectId || !itemId) return
+  const queue = projectAiQueue(projectId)
+  if (!queue) return
+  const item = queue.items.find((i) => i.id === itemId)
+  if (!item || item.status === 'running') return
+  queue.items = queue.items.filter((i) => i.id !== itemId)
+}
+
+export function clearFinishedAiTasks(projectId) {
+  if (!projectId) return
+  const queue = projectAiQueue(projectId)
+  if (!queue) return
+  queue.items = queue.items.filter(
+    (item) => item.status !== 'done' && item.status !== 'failed' && item.status !== 'aborted',
+  )
 }
 
 /* ----------------------------- 项目操作 ----------------------------- */
@@ -611,6 +1006,7 @@ export async function removeProject(id) {
       persistTabs()
     }
     delete store.runtime[id]
+    delete store.previewProxies[id]
     if (store.route.projectId === id) backToProjects()
     pushToast('项目已删除', 'success')
   } catch (err) {
@@ -885,6 +1281,22 @@ export function closeTab(projectId, tabId) {
 }
 
 /* ----------------------------- 全局设置 ----------------------------- */
+
+export async function loadUserModels() {
+  return api('GET', '/api/models')
+}
+
+export async function createUserModel(payload) {
+  return api('POST', '/api/models', payload)
+}
+
+export async function updateUserModel(id, payload) {
+  return api('PATCH', `/api/models/${id}`, payload)
+}
+
+export async function deleteUserModel(id) {
+  return api('DELETE', `/api/models/${id}`)
+}
 
 export async function saveConfig(patch) {
   try {

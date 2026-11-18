@@ -1,4 +1,4 @@
-import { config, parseModel } from './config.js'
+import { config, parseModel, CUSTOM_PROVIDER_ID } from './config.js'
 
 export class OpencodeError extends Error {
   constructor(message) {
@@ -74,6 +74,10 @@ export async function health() {
 let catalogCache = { at: 0, data: null }
 const CATALOG_TTL = 5 * 60 * 1000
 
+export function invalidateModelCatalog() {
+  catalogCache = { at: 0, data: null }
+}
+
 /**
  * 拉取 opencode 当前可用的模型列表。
  * 返回 { models: [{ providerID, providerName, modelID, name }], default: 'provider/model' }
@@ -118,8 +122,8 @@ function modelLabel(model) {
  * 解析出这次请求要用的模型，并校验它确实存在于 opencode 里。
  * 不存在时直接抛出可读的错误（而不是让 opencode 返回 500）。
  */
-export async function resolveModel() {
-  const wanted = String(config.model || '').trim()
+export async function resolveModel(modelValue = config.model) {
+  const wanted = String(modelValue || '').trim()
   if (wanted && !parseModel(wanted)) {
     throw new OpencodeError(`设置中的模型「${wanted}」格式不正确，应为 provider/model，例如 opencode/big-pickle`)
   }
@@ -134,6 +138,8 @@ export async function resolveModel() {
   if (!raw) return wanted ? parseModel(wanted) : null
   const parsed = parseModel(raw)
   if (!parsed) return null
+  // 统一配置的自定义 provider 由本应用写入 opencode 配置，catalog 可能尚未刷新，跳过校验
+  if (parsed.providerID === CUSTOM_PROVIDER_ID) return parsed
   const exists = catalog.models.some(
     (m) => m.providerID === parsed.providerID && m.modelID === parsed.modelID,
   )
@@ -171,9 +177,9 @@ export async function deleteSession(id) {
 /**
  * 发送消息并等待回复。
  * @param {string} sessionId
- * @param {{ text: string, format?: object, system?: string }} options
+ * @param {{ text: string, format?: object, system?: string, model?: string }} options
  */
-export async function prompt(sessionId, { text, format, system, timeout = 30 * 60 * 1000 } = {}, directory) {
+export async function prompt(sessionId, { text, format, system, timeout = 30 * 60 * 1000, model } = {}, directory) {
   if (!config.demo) {
     const h = await health()
     if (!h.connected) {
@@ -185,8 +191,8 @@ export async function prompt(sessionId, { text, format, system, timeout = 30 * 6
   const body = {
     parts: [{ type: 'text', text }],
   }
-  const model = await resolveModel()
-  if (model) body.model = model
+  const resolvedModel = await resolveModel(model)
+  if (resolvedModel) body.model = resolvedModel
   if (config.agent) body.agent = config.agent
   if (format) body.format = format
   if (system) body.system = system

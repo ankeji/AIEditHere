@@ -3,6 +3,7 @@ import { config } from './config.js'
 import { findRequirement, findProject, touch, broadcastState, appendLog, toast } from './store.js'
 import * as oc from './opencode.js'
 import { OpencodeError } from './opencode.js'
+import { syncCustomProvider } from './opencodeConfig.js'
 
 const runningSessions = new Map() // sessionId -> { requirementId, taskId }
 const cancelFlags = new Map() // requirementId -> { aborted: boolean }
@@ -293,6 +294,7 @@ export async function splitRequirement(requirementId) {
           )
         }
       })
+      syncCustomProvider()
       const sessionId = await oc.createSession(`需求拆解 · ${req.title}`, directory)
       req.plannerSessionId = sessionId
       const result = await oc.prompt(
@@ -490,6 +492,7 @@ export async function executeRequirement(requirementId, taskIds) {
         )
       }
       if (!req.sessionId) {
+        syncCustomProvider()
         req.sessionId = await oc.createSession(`需求执行 · ${req.title}`, directory)
         touch()
       }

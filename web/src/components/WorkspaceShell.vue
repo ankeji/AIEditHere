@@ -226,7 +226,7 @@ watch(
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 18px 0;
+  padding: 4px 12px 0;
   background: #f0f3f7;
   border-bottom: 1px solid var(--border);
   position: relative;
@@ -251,7 +251,7 @@ watch(
   align-items: center;
   gap: 6px;
   max-width: 220px;
-  padding: 8px 10px 7px;
+  padding: 7px 9px 6px;
   border: 1px solid transparent;
   border-bottom: none;
   border-radius: 9px 9px 0 0;

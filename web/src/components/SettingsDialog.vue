@@ -1,24 +1,17 @@
 <script setup>
 import { computed, reactive, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
-import { store, saveConfig, api } from '../lib/store.js'
+import { store, saveConfig, api, pushToast } from '../lib/store.js'
 
 const form = reactive({ ...store.config })
 const saving = ref(false)
-const models = ref([])
-const ocDefault = ref('')
-const modelsError = ref('')
 
-const modelOptions = computed(() =>
-  models.value.map((item) => ({
-    value: `${item.providerID}/${item.modelID}`,
-    label: `${item.providerName || item.providerID} · ${item.name || item.modelID}`,
-  })),
-)
-
-const defaultInvalid = computed(() => {
-  if (!ocDefault.value || !models.value.length) return false
-  return !models.value.some((item) => `${item.providerID}/${item.modelID}` === ocDefault.value)
+const modelTest = reactive({ loading: false, error: '', models: [...(store.config.apiModels || [])] })
+const currentModel = computed(() => {
+  if (store.config.apiBaseUrl && store.config.apiModelName) {
+    return `aiedithere/${store.config.apiModelName}`
+  }
+  return store.config.model || '使用 OpenCode 默认模型'
 })
 
 watch(
@@ -26,30 +19,60 @@ watch(
   (open) => {
     if (open) {
       Object.assign(form, store.config)
-      loadModels()
+      // 已保存的 Key 不回显，占位提示即可；清空表示不修改
+      form.apiKey = ''
+      modelTest.error = ''
+      modelTest.models = [...(store.config.apiModels || [])]
     }
   },
 )
 
-async function loadModels() {
-  models.value = []
-  ocDefault.value = ''
-  modelsError.value = ''
-  if (form.demo) return
+async function testModel() {
+  if (modelTest.loading) return
+  if (!String(form.apiBaseUrl || '').trim()) {
+    pushToast('请先填写 API 地址', 'error')
+    return
+  }
+  if (!String(form.apiModelName || '').trim()) {
+    pushToast('请先填写模型名称，例如 deepseek-v4.1-flash', 'error')
+    return
+  }
+  modelTest.loading = true
+  modelTest.error = ''
   try {
-    const data = await api('GET', '/api/opencode/models')
-    if (data?.error) modelsError.value = data.error
-    models.value = Array.isArray(data?.models) ? data.models : []
-    ocDefault.value = data?.default || ''
+    const data = await api('POST', '/api/opencode/test-model', {
+      apiBaseUrl: form.apiBaseUrl,
+      apiModelName: form.apiModelName,
+      apiKey: form.apiKey || undefined,
+    })
+    if (data?.ok) {
+      modelTest.models = Array.isArray(data.models) ? data.models : []
+      store.config.apiModels = [...modelTest.models]
+      if (data.reply) {
+        pushToast(`连接成功：${String(data.reply).slice(0, 40)}…`, 'success')
+      } else {
+        pushToast('连接成功', 'success')
+      }
+    } else {
+      modelTest.error = data?.error || '连接失败'
+      pushToast(modelTest.error, 'error')
+    }
   } catch (err) {
-    modelsError.value = err.message
+    modelTest.error = err.message
+    pushToast(err.message, 'error')
+  } finally {
+    modelTest.loading = false
   }
 }
 
 async function save() {
   if (saving.value) return
   saving.value = true
-  const ok = await saveConfig({ ...form })
+  const merged = [...new Set([...(store.config.apiModels || []), ...modelTest.models])]
+  if (String(form.apiModelName || '').trim()) merged.push(String(form.apiModelName).trim())
+  const patch = { ...form, apiModels: [...new Set(merged)] }
+  if (!String(patch.apiKey || '').trim()) delete patch.apiKey
+  const ok = await saveConfig(patch)
   saving.value = false
   if (ok) store.settingsOpen = false
 }
@@ -67,13 +90,58 @@ function close() {
           <span class="dialog-icon"><AppIcon name="gear" :size="17" /></span>
           <div>
             <h2>设置</h2>
-            <p>配置 opencode 连接与被控制的目标项目</p>
+            <p>配置统一模型 API、opencode 连接与被控制的目标项目</p>
           </div>
         </div>
         <button class="icon-btn" @click="close"><AppIcon name="x" :size="16" /></button>
       </header>
 
       <div class="dialog-body">
+        <section class="section">
+          <div class="section-head">
+            <span class="section-title"><AppIcon name="bot" :size="14" /> 统一模型 API 配置</span>
+            <button class="btn btn-ghost btn-xs" :disabled="modelTest.loading" @click="testModel">
+              {{ modelTest.loading ? '测试中…' : '测试连接' }}
+            </button>
+          </div>
+          <div class="current-model">
+            <span class="current-label">当前正在使用</span>
+            <strong>{{ currentModel }}</strong>
+            <span v-if="store.config.apiBaseUrl" class="current-endpoint">{{ store.config.apiBaseUrl }}</span>
+          </div>
+          <span class="field-hint">
+            配置 OpenAI 兼容接口（调用 /v1/chat/completions），所有用户共用。填好地址、模型名称和 Key 后可「测试连接」；测试通过的模型会加入下方列表，方便下次直接选择。
+          </span>
+          <label class="field">
+            <span class="field-label">API 地址（Base URL）</span>
+            <input v-model="form.apiBaseUrl" type="url" placeholder="https://api.example.com/v1" />
+          </label>
+          <label v-if="modelTest.models.length" class="field">
+            <span class="field-label">选择已配置模型</span>
+            <select v-model="form.apiModelName" class="model-select">
+              <option value="">请选择模型</option>
+              <option v-for="name in modelTest.models" :key="name" :value="name">{{ name }}</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field-label">模型名称</span>
+            <input v-model="form.apiModelName" type="text" placeholder="例如 gpt-4o、deepseek-chat" />
+          </label>
+          <label class="field">
+            <span class="field-label">API Key</span>
+            <input
+              v-model="form.apiKey"
+              type="password"
+              autocomplete="new-password"
+              :placeholder="store.config.apiKeyConfigured ? '已保存，留空保持不变' : '输入 API Key'"
+            />
+            <span class="field-hint">API Key 加密保存在服务端，不会返回到浏览器。</span>
+          </label>
+          <span v-if="modelTest.error" class="field-hint warn">{{ modelTest.error }}</span>
+        </section>
+
+        <div class="section-sep" />
+
         <label class="field">
           <span class="field-label"><AppIcon name="folder" :size="13" /> 默认项目目录</span>
           <input v-model="form.projectDir" type="text" placeholder="/path/to/your/project" />
@@ -89,28 +157,13 @@ function close() {
 
         <div class="field-row">
           <label class="field">
-            <span class="field-label">模型</span>
+            <span class="field-label">备用模型（未配置统一 API 时使用）</span>
             <input
               v-model="form.model"
               type="text"
-              list="oc-model-options"
-              placeholder="provider/model，留空用默认"
+              placeholder="provider/model，留空用 opencode 默认"
             />
-            <datalist id="oc-model-options">
-              <option v-for="item in modelOptions" :key="item.value" :value="item.value">
-                {{ item.label }}
-              </option>
-            </datalist>
-            <span v-if="modelsError" class="field-hint warn">{{ modelsError }}</span>
-            <span v-else-if="defaultInvalid" class="field-hint warn">
-              opencode 默认模型「{{ ocDefault }}」不存在，请从下拉列表选一个可用模型
-            </span>
-            <span v-else-if="ocDefault" class="field-hint">
-              留空使用 opencode 默认模型：{{ ocDefault }}
-            </span>
-            <span v-else-if="models.length" class="field-hint">
-              可从下拉列表选择模型，留空使用 opencode 默认模型
-            </span>
+            <span class="field-hint">配置了上面的统一 API 后，此项会被自动覆盖</span>
           </label>
           <label class="field">
             <span class="field-label">Agent</span>
@@ -176,7 +229,7 @@ function close() {
 }
 
 .dialog {
-  width: 520px;
+  width: 560px;
   max-width: 100%;
   max-height: 90vh;
   background: #fff;
@@ -231,6 +284,183 @@ function close() {
   gap: 14px;
 }
 
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  background: #fbfcfd;
+}
+
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.section-title {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text-soft);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.current-model {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  padding: 9px 10px;
+  background: #eefaf4;
+  border: 1px solid #c9eedb;
+  border-radius: 9px;
+  color: var(--green-dark);
+}
+
+.current-label {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.current-model strong {
+  font-size: 12.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.current-endpoint {
+  width: 100%;
+  font-size: 10.5px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-select {
+  width: 100%;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  padding: 8px 11px;
+  font-size: 13px;
+  outline: none;
+  background: #fff;
+}
+
+.section-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 2px 0;
+}
+
+.model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.model-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+
+.model-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.model-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-value {
+  font-size: 11px;
+  color: #9aa4b2;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.default-badge {
+  flex: none;
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--green-dark);
+  background: var(--green-soft);
+  border-radius: 99px;
+  padding: 1px 8px;
+}
+
+.link-btn {
+  flex: none;
+  font-size: 11.5px;
+  color: var(--green-dark);
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.link-btn:hover {
+  background: var(--green-soft);
+}
+
+.icon-btn.danger:hover {
+  color: var(--red);
+}
+
+.model-empty {
+  font-size: 12px;
+  color: #9aa4b2;
+  padding: 10px;
+  text-align: center;
+  border: 1px dashed var(--border-strong);
+  border-radius: 9px;
+}
+
+.model-form {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding-top: 4px;
+}
+
+.model-form-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.check-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-soft);
+  cursor: pointer;
+}
+
+.check-line input {
+  width: 14px;
+  height: 14px;
+}
+
 .field {
   display: flex;
   flex-direction: column;
@@ -255,7 +485,7 @@ function close() {
   font-size: 13px;
   outline: none;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
-  background: #fafbfc;
+  background: #fff;
 }
 
 .field input:focus {

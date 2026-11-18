@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
+import AiEditPanel from './AiEditPanel.vue'
 import {
   store,
   startProjectRun,
@@ -9,6 +10,7 @@ import {
   updatePreviewTab,
   updateProjectFields,
   loadRunLogs,
+  loadPreviewProxy,
   openProjectDialog,
   pushToast,
 } from '../lib/store.js'
@@ -24,6 +26,10 @@ const source = computed(() =>
     : null,
 )
 const isFrontend = computed(() => source.value?.type === 'frontend')
+const proxyUrl = computed(() =>
+  source.value ? store.previewProxies[source.value.id]?.url || '' : '',
+)
+const frameSrc = computed(() => (source.value ? proxyUrl.value || props.tab.url : props.tab.url))
 const canRun = computed(() => isFrontend.value && Boolean(source.value?.startCommand?.trim()))
 const runtime = computed(
   () => (source.value ? store.runtime[source.value.id] : null) || { status: 'idle', url: '', error: null },
@@ -62,7 +68,14 @@ const frameKey = ref(0)
 const frameLoading = ref(true)
 const logsOpen = ref(false)
 const logsEl = ref(null)
+const aiOpen = ref(true)
+const frameRef = ref(null)
+const detectedBannerDismissed = ref(false)
 let frameTimer = null
+
+watch(detectedUrl, () => {
+  detectedBannerDismissed.value = false
+})
 
 watch(
   () => props.tab.url,
@@ -79,6 +92,14 @@ watch(
       updatePreviewTab(props.workspaceProjectId, props.tab.id, { url: value })
       urlInput.value = value
     }
+  },
+  { immediate: true },
+)
+
+watch(
+  () => [source.value?.id, source.value?.previewUrl],
+  ([id]) => {
+    if (id) loadPreviewProxy(id)
   },
   { immediate: true },
 )
@@ -118,6 +139,13 @@ watch(
     if (next === 'running' && previous !== 'running') {
       frameKey.value += 1
     }
+  },
+)
+
+watch(
+  () => props.tab.id,
+  () => {
+    aiOpen.value = false
   },
 )
 
@@ -244,129 +272,164 @@ function scrollLogs() {
 function editProject() {
   if (source.value) openProjectDialog(source.value)
 }
+
+function refreshPreview() {
+  frameKey.value += 1
+}
+
+function toggleAiEdit() {
+  if (!source.value) {
+    pushToast('请先打开一个关联项目的预览页', 'error')
+    return
+  }
+  aiOpen.value = !aiOpen.value
+}
 </script>
 
 <template>
   <div class="preview-pane">
-    <div class="preview-toolbar">
-      <button class="icon-btn" type="button" title="刷新" @click="reload">
-        <AppIcon name="refresh" :size="15" />
-      </button>
-      <div class="url-box">
-        <AppIcon name="globe" :size="13" class="url-icon" />
-        <input
-          v-model="urlInput"
-          type="text"
-          spellcheck="false"
-          placeholder="http://localhost:8080/#/"
-          @keydown.enter.prevent="applyUrl"
-          @focus="$event.target.select()"
-        />
-      </div>
-      <button class="btn btn-ghost btn-xs" type="button" @click="applyUrl">前往</button>
-
-      <span v-if="source" class="run-chip" :class="statusMeta.cls">
-        <span class="dot" />
-        {{ statusMeta.label }}
-      </span>
-
-      <div class="spacer" />
-
-      <template v-if="isFrontend">
-        <button
-          v-if="status === 'starting' || status === 'running' || status === 'stopping'"
-          class="btn btn-ghost btn-xs"
-          type="button"
-          @click="stopRun"
-        >
-          <AppIcon name="stop" :size="11" />
-          停止
+    <div class="preview-main">
+      <div class="preview-toolbar">
+        <button class="icon-btn" type="button" title="刷新" @click="reload">
+          <AppIcon name="refresh" :size="15" />
         </button>
-        <button v-else class="btn btn-soft btn-xs" type="button" :disabled="!canRun" @click="startRun">
-          <AppIcon name="play" :size="11" />
-          启动
-        </button>
-        <button
-          class="icon-btn"
-          type="button"
-          title="重启服务"
-          :disabled="!canRun"
-          @click="restartRun"
-        >
-          <AppIcon name="refresh" :size="14" />
-        </button>
-      </template>
+        <div class="url-box">
+          <AppIcon name="globe" :size="13" class="url-icon" />
+          <input
+            v-model="urlInput"
+            type="text"
+            spellcheck="false"
+            placeholder="http://localhost:8080/#/"
+            @keydown.enter.prevent="applyUrl"
+            @focus="$event.target.select()"
+          />
+        </div>
+        <button class="btn btn-ghost btn-xs" type="button" @click="applyUrl" title="前往">前往</button>
 
-      <button
-        class="btn btn-ghost btn-xs"
-        :class="{ 'is-on': logsOpen }"
-        type="button"
-        @click="toggleLogs"
-      >
-        <AppIcon name="terminal" :size="12" />
-        日志
-      </button>
-      <button class="btn btn-ghost btn-xs" type="button" title="目标页面若禁止嵌入，请在新窗口打开" @click="openExternal">
-        <AppIcon name="external" :size="12" />
-        新窗口
-      </button>
-    </div>
-
-    <div v-if="source && isFrontend && !canRun" class="preview-banner banner-config">
-      <AppIcon name="alert" :size="14" />
-      <span>该项目还没有配置启动命令，无法自动启动预览服务。</span>
-      <button v-if="source?.isOwner" class="btn btn-soft btn-xs" @click="editProject">去配置</button>
-    </div>
-    <div v-else-if="status === 'failed'" class="preview-banner banner-error">
-      <AppIcon name="alert" :size="14" />
-      <span>{{ runtime.error || '预览服务启动失败' }}</span>
-      <button class="btn btn-ghost btn-xs" @click="showLogs">查看日志</button>
-      <button class="btn btn-soft btn-xs" :disabled="!canRun" @click="restartRun">重试</button>
-    </div>
-    <div v-if="detectedUrl" class="preview-banner banner-info">
-      <AppIcon name="spark" :size="14" />
-      <span>检测到服务实际地址 <code>{{ detectedUrl }}</code></span>
-      <button class="btn btn-ghost btn-xs" @click="useDetectedUrl">使用此地址</button>
-    </div>
-
-    <div class="frame-wrap">
-      <iframe
-        v-if="tab.url"
-        :key="`${frameKey}-${tab.url}`"
-        :src="tab.url"
-        class="preview-frame"
-        allow="clipboard-read; clipboard-write; fullscreen"
-        referrerpolicy="no-referrer"
-        @load="onFrameLoad"
-      />
-      <div v-else class="frame-empty">
-        <div class="empty-icon"><AppIcon name="globe" :size="20" /></div>
-        <div>还没有预览地址</div>
-        <span class="field-hint">在上方输入运行后的访问地址，例如 http://localhost:8080/#/</span>
-      </div>
-      <div v-if="tab.url && frameLoading" class="frame-loading">
-        <span class="spinner" />
-        <span>正在加载 {{ tab.url }}</span>
-      </div>
-    </div>
-
-    <div v-if="logsOpen" class="run-logs">
-      <div class="run-logs-head">
-        <span class="run-logs-title">
-          <AppIcon name="terminal" :size="13" />
-          运行日志
-          <span v-if="source" class="muted">{{ source.name }}</span>
+        <span v-if="source" class="run-chip" :class="statusMeta.cls">
+          <span class="dot" />
+          {{ statusMeta.label }}
         </span>
-        <span class="run-logs-cmd">{{ source?.startCommand || '' }}</span>
-        <button class="icon-btn" type="button" title="收起日志" @click="logsOpen = false">
-          <AppIcon name="x" :size="14" />
+
+        <div class="spacer" />
+
+        <template v-if="isFrontend">
+          <button
+            v-if="status === 'starting' || status === 'running' || status === 'stopping'"
+            class="btn btn-ghost btn-xs"
+            type="button"
+            title="停止预览服务"
+            @click="stopRun"
+          >
+            <AppIcon name="stop" :size="11" />
+          </button>
+          <button v-else class="btn btn-soft btn-xs" type="button" :disabled="!canRun" @click="startRun" title="启动预览服务">
+            <AppIcon name="play" :size="11" />
+          </button>
+          <button
+            class="icon-btn"
+            type="button"
+            title="重启服务"
+            :disabled="!canRun"
+            @click="restartRun"
+          >
+            <AppIcon name="refresh" :size="14" />
+          </button>
+        </template>
+
+        <button
+          class="btn btn-ghost btn-xs"
+          :class="{ 'is-on': aiOpen }"
+          type="button"
+          :disabled="!source"
+          title="AI 修改"
+          @click="toggleAiEdit"
+        >
+          <AppIcon name="spark" :size="12" />
+          AI 修改
+        </button>
+        <button
+          class="btn btn-ghost btn-xs"
+          :class="{ 'is-on': logsOpen }"
+          type="button"
+          title="运行日志"
+          @click="toggleLogs"
+        >
+          <AppIcon name="terminal" :size="12" />
+          日志
         </button>
       </div>
-      <div ref="logsEl" class="run-logs-body">
-        <div v-for="(entry, index) in logState.entries" :key="index" class="log-line" :class="`log-${entry.level}`">{{ entry.text }}</div>
-        <div v-if="!logState.entries.length" class="log-empty">暂无日志</div>
+
+      <div v-if="source && isFrontend && !canRun" class="preview-banner banner-config">
+        <AppIcon name="alert" :size="14" />
+        <span>该项目还没有配置启动命令，无法自动启动预览服务。</span>
+        <button v-if="source?.isOwner" class="btn btn-soft btn-xs" @click="editProject">去配置</button>
+      </div>
+      <div v-else-if="status === 'failed'" class="preview-banner banner-error">
+        <AppIcon name="alert" :size="14" />
+        <span>{{ runtime.error || '预览服务启动失败' }}</span>
+        <button class="btn btn-ghost btn-xs" @click="showLogs">查看日志</button>
+        <button class="btn btn-soft btn-xs" :disabled="!canRun" @click="restartRun">重试</button>
+      </div>
+      <div v-if="detectedUrl && !detectedBannerDismissed" class="preview-banner banner-info">
+        <AppIcon name="spark" :size="14" />
+        <span>检测到服务实际地址 <code>{{ detectedUrl }}</code></span>
+        <button class="btn btn-ghost btn-xs" @click="useDetectedUrl">使用此地址</button>
+        <button class="icon-btn" type="button" title="关闭提示" @click="detectedBannerDismissed = true">
+          <AppIcon name="x" :size="13" />
+        </button>
+      </div>
+
+      <div class="frame-wrap">
+        <iframe
+          v-if="frameSrc"
+          ref="frameRef"
+          :key="`${frameKey}-${frameSrc}`"
+          :src="frameSrc"
+          class="preview-frame"
+          allow="clipboard-read; clipboard-write; fullscreen"
+          referrerpolicy="no-referrer"
+          @load="onFrameLoad"
+        />
+        <div v-else class="frame-empty">
+          <div class="empty-icon"><AppIcon name="globe" :size="20" /></div>
+          <div>还没有预览地址</div>
+          <span class="field-hint">在上方输入运行后的访问地址，例如 http://localhost:8080/#/</span>
+        </div>
+        <div v-if="tab.url && frameLoading" class="frame-loading">
+          <span class="spinner" />
+          <span>正在加载 {{ tab.url }}</span>
+        </div>
+      </div>
+
+      <div v-if="logsOpen" class="run-logs">
+        <div class="run-logs-head">
+          <span class="run-logs-title">
+            <AppIcon name="terminal" :size="13" />
+            运行日志
+            <span v-if="source" class="muted">{{ source.name }}</span>
+          </span>
+          <span class="run-logs-cmd">{{ source?.startCommand || '' }}</span>
+          <button class="icon-btn" type="button" title="收起日志" @click="logsOpen = false">
+            <AppIcon name="x" :size="14" />
+          </button>
+        </div>
+        <div ref="logsEl" class="run-logs-body">
+          <div v-for="(entry, index) in logState.entries" :key="index" class="log-line" :class="`log-${entry.level}`">{{ entry.text }}</div>
+          <div v-if="!logState.entries.length" class="log-empty">暂无日志</div>
+        </div>
       </div>
     </div>
+
+    <AiEditPanel
+      v-if="aiOpen"
+      class="ai-panel"
+      :iframe="frameRef"
+      :project="source"
+      :preview-url="urlInput || tab.url"
+      @close="aiOpen = false"
+      @refresh="refreshPreview"
+    />
   </div>
 </template>
 
@@ -375,21 +438,52 @@ function editProject() {
   flex: 1;
   min-height: 0;
   display: flex;
+  flex-direction: row;
+  gap: 8px;
+  padding: 8px;
+  position: relative;
+}
+
+.preview-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
   flex-direction: column;
-  gap: 9px;
-  padding: 11px 18px 16px;
+  gap: 7px;
+}
+
+.ai-panel {
+  flex: 0 0 390px;
+  width: 390px;
+  min-width: 280px;
+  max-width: 46vw;
+  min-height: 0;
+  display: flex;
 }
 
 .preview-toolbar {
   flex: none;
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 5px;
   background: #fff;
   border: 1px solid var(--border);
-  border-radius: 11px;
-  padding: 7px 9px;
+  border-radius: 10px;
+  padding: 4px 6px;
   box-shadow: 0 1px 2px rgba(23, 32, 43, 0.03);
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex-wrap: nowrap;
+}
+
+.preview-toolbar::-webkit-scrollbar {
+  height: 4px;
+}
+
+.preview-toolbar::-webkit-scrollbar-thumb {
+  background: #d7dee7;
+  border-radius: 99px;
 }
 
 .url-box {
@@ -422,9 +516,9 @@ function editProject() {
   border: none;
   outline: none;
   background: transparent;
-  font-size: 12.5px;
+  font-size: 12px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  padding: 6px 0;
+  padding: 4px 0;
   color: var(--text-soft);
 }
 
@@ -584,7 +678,7 @@ function editProject() {
 
 .run-logs {
   flex: none;
-  height: 210px;
+  height: 180px;
   display: flex;
   flex-direction: column;
   border: 1px solid var(--border);
@@ -696,14 +790,21 @@ function editProject() {
   .run-chip {
     display: none;
   }
+}
 
-  .preview-toolbar {
-    flex-wrap: wrap;
+@media (max-width: 900px) {
+  .preview-pane {
+    flex-direction: column;
   }
 
-  .url-box {
-    order: -1;
-    flex-basis: 100%;
+  .ai-panel {
+    position: absolute;
+    inset: 8px;
+    width: auto;
+    max-width: none;
+    height: calc(100% - 16px);
+    z-index: 30;
+    border-radius: 10px;
   }
 }
 </style>

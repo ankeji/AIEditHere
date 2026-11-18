@@ -184,10 +184,11 @@ function titleOf(text) {
   return firstLine.length > 60 ? `${firstLine.slice(0, 60)}…` : firstLine
 }
 
-export function createRequirement(text, projectId) {
+export function createRequirement(text, projectId, userId = null) {
   const requirement = {
     id: crypto.randomUUID(),
     projectId: projectId || db.projects[0]?.id || null,
+    userId: userId ? String(userId) : null,
     text: String(text).trim(),
     title: titleOf(text),
     status: 'pending',

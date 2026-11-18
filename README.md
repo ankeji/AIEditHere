@@ -101,6 +101,10 @@ npm start       # 单端口启动，访问 http://localhost:4400
 
 > 如果预览区域空白，可能是目标站点通过 `X-Frame-Options` 禁止被嵌入，点右上角 **新窗口** 直接打开即可。
 
+### 统一模型 API 配置
+
+右上角「设置」支持配置所有用户共用的 OpenAI-compatible 模型：API 地址（Base URL）、模型名称和 API Key。保存后 AIEditHere 会将配置同步到 OpenCode 的 provider 配置中；API Key 在 AIEditHere 配置文件中加密保存，不会通过状态接口返回。可用模型应使用服务商的实际模型 ID，例如 `gpt-4o`、`deepseek-chat`。
+
 ### 第二步：写需求、拆解、执行
 
 1. **第 1 栏**输入需求文本（`Ctrl`/`⌘` + `Enter` 快速提交），点「添加需求」。
@@ -120,6 +124,7 @@ npm start       # 单端口启动，访问 http://localhost:4400
 | `GET` | `/api/health` | opencode 健康检查（`?force=1` 跳过缓存） |
 | `PUT` | `/api/config` | 修改配置（地址/模型/默认项目目录/演示模式…） |
 | `POST` | `/api/opencode/reconnect` | 重新连接 / 拉起 opencode |
+| `POST` | `/api/opencode/test-model` | 测试统一模型 API 连接并列出可用模型 `{ apiBaseUrl, apiKey? }` |
 | `GET` | `/api/projects` | 项目列表 |
 | `POST` | `/api/projects` | 新建项目 `{ name, path, description?, type?, startCommand?, previewUrl?, autoStart?, create? }` |
 | `PATCH` | `/api/projects/:id` | 修改项目（名称 / 目录 / 描述 / 类型 / 启动命令 / 预览地址 / 自动启动） |

@@ -65,6 +65,20 @@ const TABLES = [
     state_json LONGTEXT NOT NULL,
     updated_at BIGINT NOT NULL
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS user_models (
+    id CHAR(36) NOT NULL PRIMARY KEY,
+    user_id CHAR(36) NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    provider_id VARCHAR(100) NOT NULL,
+    model_id VARCHAR(190) NOT NULL,
+    is_default TINYINT(1) NOT NULL DEFAULT 0,
+    enabled TINYINT(1) NOT NULL DEFAULT 1,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    KEY idx_user_models_user (user_id),
+    UNIQUE KEY uniq_user_models_model (user_id, provider_id, model_id),
+    CONSTRAINT fk_user_models_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 ]
 
 export async function initAuthDb() {
